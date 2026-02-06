@@ -1,0 +1,2069 @@
+---
+title: "Projet GLM-GAM"
+author: "Axel Vossen"
+date: "2025-12-08"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  cache = TRUE,
+  fig.width = 8,
+  fig.height = 5,
+  out.width = "100%"
+)
+```
+
+```{r library,include=FALSE}
+# The easiest way to get recipes is to install all of tidymodels:
+# install.packages("tidymodels")
+options(encoding = 'UTF-8')
+#Loading all the necessary packages
+if (!require("caret")) install.packages("caret")
+if (!require("recipes")) install.packages("recipes")
+if (!require("visreg")) install.packages("visreg")
+if (!require("MASS")) install.packages("MASS")
+if (!require("glmnet")) install.packages("glmnet")
+if (!require("jtools")) install.packages("jtools")
+if (!require("scales")) install.packages("scales")
+if (!require("forcats")) install.packages("forcats")
+if (!require("stringr")) install.packages("stringr")
+if (!require("poissonreg")) install.packages("poissonreg")
+
+
+require("caret")
+require("recipes")
+require("visreg")
+require("MASS")
+require("glmnet")
+require("jtools")
+require("scales")
+require("forcats")
+require("stringr")
+require("arrow")
+require("forcats")
+require("yardstick")
+require("parsnip")
+require("workflows")
+require("poissonreg")
+require("rsample")
+require("tune")
+require("yardstick")
+require("tidyr")
+require("dplyr")
+require(ggplot2)
+require(wesanderson)
+
+options(repr.plot.width = 8, repr.plot.height = 6,repr.plot.res = 150);
+```
+
+# Part 1: GLM Analysis
+
+## Data preparation
+
+## Categorical variables
+
+Let's start with loading the data set containing the insurance portfolio of motor third party liability (MTPL) policies from a Belgian insurer. We immediately follow up on our data preparation with converting categorical variables, wrongly saved as character type in R, into factors.
+
+```{r Data loading and switch to factors}
+load("mtpl_be.rda")
+str(mtpl_be)
+
+mtpl_be <- mtpl_be %>% mutate(COVERAGE = as.factor(COVERAGE)) %>% mutate(FUEL = as.factor(FUEL)) %>% mutate(USE = as.factor(USE)) %>% mutate(FLEET = as.factor(FLEET)) %>% mutate(SEX = as.factor(SEX))
+str(mtpl_be)
+```
+
+Now that we have proper factors for our categorical variables, we will assess whether the reference level, is the most appropriate one. Let's recall that the reference level is usually fixed as the first term when treating such data set, while we aim to fix the reference level to the factor with the most occurrence. To help us, we use the **fct_count** function from package *forecats* to evaluate the number of rows for each level of the factor variables. To fasten our computation, we have decided to use right after the function **fct_infreq** from the *forecats* package as well, which will directly reassign the reference level to the most frequent factor.
+
+### Coverage
+
+In this variable, we deal with the type of coverage provided by the insurance policy: only third-party liability (TPL), partial omnium (PO) and full omnium (FO). Note that Partial omnium is equal to *TPL* + limited material damage, while full omnium corresponds to *TPL* + comprehensive material damage.
+
+```{r Coverage reference level}
+levels(mtpl_be$COVERAGE)
+
+```
+
+We observe that the reference level is initially set to *FO*, being the first factor of the Coverage variable. But with the output from *fct_count*, we understand that *TPL* is actually the reference level with the most observations.
+
+```{r}
+mtpl_be$COVERAGE %>% fct_count(sort=TRUE,prop = TRUE)
+
+```
+
+Therefore, we use the function *fct_infreq* to relevel properly with respect to the highest observed factor. Another alternative would be to use the function **relevel**.
+
+```{r}
+mtpl_be$COVERAGE = mtpl_be$COVERAGE %>% fct_infreq() 
+
+```
+
+### Fuel
+
+Regarding the type of fuel of the vehicles, *diesel* appears to be the reference level.
+
+```{r}
+levels(mtpl_be$FUEL)
+
+```
+
+But from the following output *gasoline* is the most common of the two.
+
+```{r}
+mtpl_be$FUEL %>% fct_count(sort=TRUE,prop = TRUE)
+
+```
+
+We thus define the reference level as *gasoline* for the type of fuel used.
+
+```{r}
+mtpl_be$Fuel = mtpl_be$FUEL %>% fct_infreq()
+
+```
+
+### Use
+
+Let's now tackle the type of use of the vehicle between *private* and *work*. The reference level is *private*.
+
+```{r}
+levels(mtpl_be$USE)
+
+```
+
+Meanwhile, it appears that the reference level is rightly chosen as the *private* use is the most common with approximately 95.17% occurrence.
+
+```{r}
+mtpl_be$USE %>% fct_count(sort=TRUE,prop = TRUE)
+
+```
+
+### Fleet
+
+We will now deal with this categorical variable designating if the the vehicle is part of a fleet. The reference level is defined as *N* standing for No.
+
+```{r}
+levels(mtpl_be$FLEET)
+
+```
+
+Again, we don't need to further process the data as most vehicles are not part of a fleet.
+
+```{r}
+mtpl_be$FLEET %>% fct_count(sort=TRUE,prop = TRUE)
+
+```
+
+### Sex
+
+The final categorical variable we will deal with is the gender of the policyholder between *male* and *female*, with the latter defined as the reference level.
+
+```{r}
+levels(mtpl_be$SEX)
+
+```
+
+With respect to the output from the *fct_count* function, the male gender is the most represented in the data set.
+
+```{r}
+mtpl_be$SEX %>% fct_count(sort=TRUE,prop = TRUE)
+
+```
+
+Which we thus reassign with the *fct_infreq* function.
+
+```{r}
+mtpl_be$SEX = mtpl_be$SEX %>% fct_infreq()
+
+```
+
+## Continuous variables
+
+Moreover, for the sake of simplifying our analysis, we process the following continuous variables: *ageph*, *agec*, *power* and *bm*. To this end, the idea is to bin continuous variables. To do so, I will first rely on the *discretize* function from package **recipe**. I will iterativelly try different cuts value, until it shows warning stating that the binning function refuses to discretize due to lack of enough distinct values without producing degenerate bins. Then we apply the *mutate* and *cut* functions on the continuous variable to classify them in factor-type categories.
+
+### Ageph
+
+First, we deal with the age of the policyholders in years, from 18 to 95 years old.
+
+```{r}
+min(mtpl_be$AGEPH);max(mtpl_be$AGEPH)
+```
+
+We thus apply the *discretize* function and find an appropriate cuts amount of 6.
+
+```{r}
+hist(mtpl_be$AGEPH, main = "Histogram of the age of policyholders", xlab= "policyholder's age")
+mtpl_be$AGEPH %>% discretize(mtpl_be$AGEPH, cuts=5)
+mtpl_be$AGEPH %>% discretize(mtpl_be$AGEPH, cuts=6)
+mtpl_be$AGEPH %>% discretize(mtpl_be$AGEPH, cuts=7)
+```
+
+We thus obtain the following age
+
+```{r}
+mtpl_be <- mtpl_be %>% mutate(AGEPH_fac = cut(AGEPH , breaks=6 ))
+levels(mtpl_be$AGEPH_fac)
+
+```
+
+The final step is to assign the proper reference level, as we did with categorical values. We identify the bin of ages (30.8,43.7] as being the most observed (30.24%), which is then set with the *fct_infreq* function.
+
+```{r}
+mtpl_be$AGEPH_fac %>% fct_count(sort=TRUE,prop = TRUE)
+mtpl_be$AGEPH_fac = mtpl_be$AGEPH_fac %>% fct_infreq()
+
+```
+
+### Agec
+
+Secondly, we deal with the age of the vehicles in years, between 0 and 48 years old.
+
+```{r, echo=FALSE}
+min(mtpl_be$AGEC);max(mtpl_be$AGEC)
+```
+
+We thus apply the *discretize* function and find an appropriate cuts amount of 3.
+
+```{r}
+hist(mtpl_be$AGEC, main="Histogram of car age", xlab="Car age")
+mtpl_be$AGEC %>% discretize(mtpl_be$AGEC, cuts=2)
+mtpl_be$AGEC %>% discretize(mtpl_be$AGEC, cuts=3)
+mtpl_be$AGEC %>% discretize(mtpl_be$AGEC, cuts=4)
+```
+
+We thus obtain the following age bins for the vehicles.
+
+```{r}
+mtpl_be <- mtpl_be %>% mutate(AGEC_fac = cut(AGEC , breaks=c(-0.5,5,9,max(mtpl_be$AGEC))))
+levels(mtpl_be$AGEC_fac)
+
+```
+
+The reference level remains unchanged as vehicles between 0 and 5 years old represent 36.27% of all vehicles registered.
+
+```{r}
+mtpl_be$AGEC_fac %>% fct_count(sort=TRUE,prop = TRUE)
+
+```
+
+### Power
+
+Let's investigate the horsepower of vehicles in kilowatt in a range of 10 to 243. Naturally, the more horsepower a vehicle has, the more kilowatts it represents
+
+```{r, echo=FALSE}
+min(mtpl_be$POWER);max(mtpl_be$POWER)
+```
+
+We find the optimal amount of cuts being equal to 5.
+
+```{r}
+hist(mtpl_be$POWER, main = "Horsepower of vehicles", xlab="kilowatt")
+mtpl_be$POWER %>% discretize(mtpl_be$POWER, cuts=3)
+mtpl_be$POWER %>% discretize(mtpl_be$POWER, cuts=4)
+mtpl_be$POWER %>% discretize(mtpl_be$POWER, cuts=5)
+mtpl_be$POWER %>% discretize(mtpl_be$POWER, cuts=6)
+
+```
+
+These are the different factor ranges.
+
+```{r}
+mtpl_be <- mtpl_be %>% mutate(POWER_fac = cut(POWER , breaks=c(-0.5, 40, 48, 55, 66, max(mtpl_be$POWER))))
+levels(mtpl_be$POWER_fac)
+
+```
+
+The reference level remains unchanged as the highest percentage of observed horsepower is in the range 0 to 40.
+
+```{r}
+mtpl_be$POWER_fac %>% fct_count(sort=TRUE,prop = TRUE)
+
+```
+
+### Bm
+
+The final variable we will be processing is the one relative to the level in the former compulsory Belgian bonus-malus scale. It goes from level 0 to 22, where the higher level indicates the worse claim history.
+
+```{r}
+hist(mtpl_be$BM, main = "Level in the BM scale", xlab="level")
+
+```
+
+Since the discretize function does not provide any suggestion of bins, we made assumptions based on the histogram, and chose the following four categories
+
+```{r}
+mtpl_be <- mtpl_be %>% mutate(BM_fac = cut(BM, breaks=c(-0.5,0, 5,11, max(mtpl_be$BM))))
+levels(mtpl_be$BM_fac)
+
+```
+
+Although the first factor only accounts for level 0, it is clearly the most observed value and deserved to be on its own. To support my assumption, we see that it may remain as the reference level since it gathers approximately 37.77% of the policyholders.
+
+```{r}
+mtpl_be$BM_fac %>% fct_count(sort=TRUE,prop = TRUE)
+
+```
+
+## Exploratory data analysis
+
+We completed the first key part of working with data which is data processing. In this section, we will represent in a more visual way the different values we are dealing with to further fit our GLM. Indeed, in this section, we will investigate how each information from policyholders have an influence on the claim frequency.
+
+### Coverage
+
+Let's first start with information regarding coverage. We observe that *TPL* tend to cause the highest claim frequency with 14.6% while *Partial omnium (PO)* scores lowest with 12.78%. In between, we find the *Full omnium (FO)* category with 13.54%. We thus conclude that in general, based on our data set, *TPL* coverage tend to have 2.18% and 1.06% more claims than *PO* and *FO* repsectively.
+
+```{r}
+# Summarise coverage
+cov_summary <- mtpl_be %>%
+  group_by(COVERAGE) %>%
+  summarise(
+    totalExposure = sum(EXP),
+    Number.Claims = sum(NCLAIMS),
+    Obs.Claim.Freq = sum(NCLAIMS) / sum(EXP),
+    .groups = "drop"
+  )
+
+ggplot(
+  cov_summary,
+  aes(
+    x = COVERAGE, y = Obs.Claim.Freq,
+    fill = COVERAGE,
+    label = percent(Obs.Claim.Freq, accuracy=0.01)
+  )
+) +
+  geom_bar(stat = "identity") +
+  geom_label() +
+  guides(fill = "none") +
+  scale_x_discrete(name = "Coverage type" ) +
+  scale_fill_brewer(palette = "Dark2")
+  scale_y_continuous("Observed claim Frequency", labels = label_percent())
+
+```
+
+### Fuel
+
+Here we observe that Fuel represents an important factor in claim frequency with *diesel* scoring more than 2.5% more than *gasoline*
+
+```{r}
+gas_summary <- mtpl_be %>%
+  group_by(FUEL) %>%
+  summarise(
+    totalExposure = sum(EXP),
+    Number.Observations = length(EXP),
+    Number.Claims = sum(NCLAIMS),
+    Obs.Claim.Freq = sum(NCLAIMS) / sum(EXP)
+  )
+
+ggplot(
+  gas_summary,
+  aes(
+    x = FUEL, y = Obs.Claim.Freq,
+    fill = FUEL,
+    label = percent(Obs.Claim.Freq, accuracy=0.01)
+  )
+) +
+  geom_bar(stat = "identity") +
+  geom_label() +
+  guides(fill = "none") +
+  scale_x_discrete(name = "Fuel") +
+  scale_y_continuous("Observed claim Frequency", labels = label_percent())
+
+```
+
+### Sex
+
+In this case we observe the difference in claims frequency between men and women. Based on the observed data in our data set, women tend to cause more claims than man with an increase of 1.23%.
+
+```{r}
+sex_summary <- mtpl_be %>%
+  group_by(SEX) %>%
+  summarise(
+    totalExposure = sum(EXP),
+    Number.Observations = length(EXP),
+    Number.Claims = sum(NCLAIMS),
+    Obs.Claim.Freq = sum(NCLAIMS) / sum(EXP)
+  )
+
+ggplot(
+  sex_summary,
+  aes(
+    x = SEX, y = Obs.Claim.Freq,
+    fill = SEX,
+    label = percent(Obs.Claim.Freq, accuracy=0.01)
+  )
+) +
+  geom_bar(stat = "identity") +
+  geom_label() +
+  guides(fill = "none") +
+  scale_x_discrete(name = "Gender") +
+  scale_y_continuous("Observed claim Frequency", labels = label_percent())+
+  scale_fill_brewer(palette="Dark2")
+  
+```
+
+### Use
+
+When investigating the use of the car, we observe only a slight difference in frequency, which gives us the insight that this information is not the most important one when modelling claim frequencies.
+
+```{r}
+use_summary <- mtpl_be %>%
+  group_by(USE) %>%
+  summarise(
+    totalExposure = sum(EXP),
+    Number.Observations = length(EXP),
+    Number.Claims = sum(NCLAIMS),
+    Obs.Claim.Freq = sum(NCLAIMS) / sum(EXP)
+  )
+
+ggplot(
+  use_summary,
+  aes(
+    x = USE, y = Obs.Claim.Freq,
+    fill = USE,
+    label = percent(Obs.Claim.Freq, accuracy=0.01)
+  )
+) +
+  geom_bar(stat = "identity") +
+  geom_label() +
+  guides(fill = "none") +
+  scale_x_discrete(name = "Use") +
+  scale_y_continuous("Observed claim Frequency", labels = label_percent())+
+  scale_fill_manual(values=wes_palette(name="GrandBudapest1"))
+  
+```
+
+### Fleet
+
+On the other hand, not being part of a fleet tends to cause almost 3% more claims than being in one.
+
+```{r}
+fleet_summary <- mtpl_be %>%
+  group_by(FLEET) %>%
+  summarise(
+    totalExposure = sum(EXP),
+    Number.Observations = length(EXP),
+    Number.Claims = sum(NCLAIMS),
+    Obs.Claim.Freq = sum(NCLAIMS) / sum(EXP)
+  )
+
+ggplot(
+  fleet_summary,
+  aes(
+    x = FLEET, y = Obs.Claim.Freq,
+    fill =FLEET,
+    label = percent(Obs.Claim.Freq, accuracy=0.01)
+  )
+) +
+  geom_bar(stat = "identity") +
+  geom_label() +
+  guides(fill = "none") +
+  scale_x_discrete(name = "Fleet") +
+  scale_y_continuous("Observed claim Frequency", labels = label_percent())+
+  scale_fill_manual(values=wes_palette(name="Chevalier1"))
+  
+```
+
+### ageph
+
+We know from a fact that the age of the policyholder is an important information regarding claim frequency. This argument is supported with the following graph showing young drivers between 18 and 31 having much higher frequency than any other subgroups, peaking at 21.36%. We then observe claim frequency decreasing with age until observing an upward trend for elderlies above 82. This trend is actually quite representative of what might be observed in other data sets and research studies.
+
+```{R}
+ageph_summary <- mtpl_be %>%
+  group_by(AGEPH_fac) %>%
+  summarise(
+    totalExposure = sum(EXP),
+    Number.Observations = length(EXP),
+    Number.Claims = sum(NCLAIMS),
+    Obs.Claim.Freq = sum(NCLAIMS) / sum(EXP)
+  )
+
+ggplot(
+  ageph_summary,
+  aes(
+    x = reorder(AGEPH_fac,c(2,3,4,1,5,6), decreasing=FALSE), y = Obs.Claim.Freq,
+    fill =AGEPH_fac,
+    label = percent(Obs.Claim.Freq, accuracy=0.01)
+  )
+) +
+  geom_bar(stat = "identity") +
+  geom_label() +
+  guides(fill = "none") +
+  scale_x_discrete(name = "Policyholder's age") +
+  scale_y_continuous("Observed claim Frequency", labels = label_percent())+
+  scale_fill_brewer(palette = "BrBG")
+
+
+
+```
+
+### Age C
+
+We tend to see a slight increase of the number of claims when the car gets older. Indeed, the interval (9,48] scores 1% more than cars between 0 and 5 years old and 0.5% for cars aged between 6 and 9.
+
+```{R}
+agec_summary <- mtpl_be %>%
+  group_by(AGEC_fac) %>%
+  summarise(
+    totalExposure = sum(EXP),
+    Number.Observations = length(EXP),
+    Number.Claims = sum(NCLAIMS),
+    Obs.Claim.Freq = sum(NCLAIMS) / sum(EXP)
+  )
+
+ggplot(
+  agec_summary,
+  aes(
+    x = AGEC_fac, y = Obs.Claim.Freq,
+    fill =AGEC_fac,
+    label = percent(Obs.Claim.Freq, accuracy=0.01)
+  )
+) +
+  geom_bar(stat = "identity") +
+  geom_label() +
+  guides(fill = "none") +
+  scale_x_discrete(name = "Car age") +
+  scale_y_continuous("Observed claim Frequency", labels = label_percent())+
+  scale_fill_brewer(palette = "PuOr")
+
+
+```
+
+### Power
+
+Although we might expect the power of the vehicle to have a huge impact on the number of claims, we observe slight differences between categories. But lowest power in kilowatts still has the lowest frequency while the highest category rises by apporximately 1.6% from the reference level.
+
+```{R}
+pow_summary <- mtpl_be %>%
+  group_by(POWER_fac) %>%
+  summarise(
+    totalExposure = sum(EXP),
+    Number.Observations = length(EXP),
+    Number.Claims = sum(NCLAIMS),
+    Obs.Claim.Freq = sum(NCLAIMS) / sum(EXP)
+  )
+
+
+ggplot(
+  pow_summary,
+  aes(
+    x = POWER_fac, y = Obs.Claim.Freq,
+    fill =POWER_fac,
+    label = percent(Obs.Claim.Freq, accuracy=0.01)
+  )
+) +
+  geom_bar(stat = "identity") +
+  geom_label() +
+  guides(fill = "none") +
+  scale_x_discrete(name = "Power in kw") +
+  scale_y_continuous("Observed claim Frequency", labels = label_percent())+
+  scale_fill_brewer(palette = "PRGn")
+
+
+```
+
+Although the plot above shows that the frequency of claims is higher for high power, for the sake of visualization only, we have subdivided the categories even more to better show the linear relationship with power. We won't use this classification since the extreme categories are too small sampled compared to others which might bias our statistical analysis. Therefore, we will stick with our former intervals regarding POWER for later use.
+
+```{R}
+mtpl_be2 <- mtpl_be %>% mutate(POWER_fac = cut(POWER , breaks=c(-0.5, 20, 60, 70, 110, max(mtpl_be$POWER))))
+mtpl_be2$POWER_fac %>% fct_count(sort=TRUE,prop = TRUE)
+
+pow_summary2 <- mtpl_be2 %>%
+  group_by(POWER_fac) %>%
+  summarise(
+    totalExposure = sum(EXP),
+    Number.Observations = length(EXP),
+    Number.Claims = sum(NCLAIMS),
+    Obs.Claim.Freq = sum(NCLAIMS) / sum(EXP)
+  )
+
+
+ggplot(
+  pow_summary2,
+  aes(
+    x = POWER_fac, y = Obs.Claim.Freq,
+    fill =POWER_fac,
+    label = percent(Obs.Claim.Freq, accuracy=0.01)
+  )
+) +
+  geom_bar(stat = "identity") +
+  geom_label() +
+  guides(fill = "none") +
+  scale_x_discrete(name = "Power in kw") +
+  scale_y_continuous("Observed claim Frequency", labels = label_percent())+
+  scale_fill_brewer(palette = "PRGn")
+
+
+```
+
+Here we thus observe clearly that claims are more frequent as the car's horsepower increases.
+
+### BM
+
+Lastly, when investigating the relation between the Bonus-malus scale and the frequency of claims, we observe a clear increase when going up the ladder. The results can be intuitively assumed since a policyholder will go up the ladder when he or she reports a claim where he or she is at fault. Naturally, the more the persons reports claims, the more that person will be up on the ladder and higher claim frequency might be observed in higher intervals. Although the reference level is level 0, the claim frequency more than doubles compared to levels between 12 and 22. One might think that these observations are biased since the category 12 to 22 gathers half the levels in the BM scale, but it actually accounts for 2.81% of the policyholders. The results are then really self-explanatory. 
+
+```{R}
+bm_summary <- mtpl_be %>%
+  group_by(BM_fac) %>%
+  summarise(
+    totalExposure = sum(EXP),
+    Number.Observations = length(EXP),
+    Number.Claims = sum(NCLAIMS),
+    Obs.Claim.Freq = sum(NCLAIMS) / sum(EXP)
+  )
+
+ggplot(
+  bm_summary,
+  aes(
+    x = BM_fac, y = Obs.Claim.Freq,
+    fill =BM_fac,
+    label = percent(Obs.Claim.Freq, accuracy=0.01)
+  )
+) +
+  geom_bar(stat = "identity") +
+  geom_label() +
+  guides(fill = "none") +
+  scale_x_discrete(name = "Bonus-Malus level") +
+  scale_y_continuous("Observed claim Frequency", labels = label_percent())+
+  scale_fill_brewer(palette = "PuOr")
+
+
+```
+
+## Frequency Model (Poisson)
+
+After getting more insights on the arguments relative to our insurance portfolio, we will start to fit GLM's models and see which one is the most optimal, based on the variables explored before. Here we investigate models based on the frequency, defined by the argument *NCLAIMS* in our data set. We will start our development with the hypothesis that the frequency follows a Poisson distribution, the same way as it is usually assumed.
+
+To help us determine which model is the most optimal, we separate the data set into a training and a test set with the help of the function *createDataPartition* from the **caret** package. The p argument defines the percentage of data in the training set. The idea will be to fit the model based on the values of the training set and compare the fitted, as well as the predicted values with respect to the test set to evaluate if models capture appropriately the underlying features of the variables.
+
+```{r}
+set.seed(21)  # For reproducibility
+in_training = createDataPartition(mtpl_be$NCLAIMS, times = 1, p = 0.8, list = FALSE)
+training_set = mtpl_be[in_training, ]
+testing_set = mtpl_be[-in_training, ]
+
+```
+
+Now, we run the *glm* function on our training set with respect to the number of claims (*NCLAIMS*). As offset, we use the log_link function of the exposure. Our initial model *m0* includes only the intercept, knowingly the log(exposure).
+
+```{r}
+m0 <- glm(NCLAIMS ~ offset(log(EXP)), data = training_set, family = poisson())
+summary(m0)
+
+```
+
+We can understand a glm model with only the exponential of the intercept $\exp\beta_0$ as the average claim frequency such that: $\exp\beta_0$ = $\displaystyle\frac{\sum_i NCLAIMS_i}{\sum_i Exposure_i}$. This may be verified with the following computation:
+
+```{r}
+a <- list(exp(m0$coef[1]), # m0$coef[1] is the Intercept
+     with(training_set, sum(NCLAIMS) / sum(EXP)))
+log(a[[1]])
+```
+
+To enhance our initial model, we will consider the additional discrete variables and binned continuous variables we explored in the previous sections, but we include the variables without interaction. Since GLMs are not well equipped to manage continuous random variables, we will exclude from the model the longitude and latitude spatial variables. But we will still consider the other discretized continuous variables. We thus define the full model in *m1*.
+
+```{r}
+m1 <- glm(NCLAIMS ~ offset(log(EXP))+ COVERAGE + FUEL + SEX + USE + FLEET+
+            AGEPH_fac + AGEC_fac + POWER_fac + BM_fac, data =
+            training_set, family = poisson(link=log))
+summary(m1)
+```
+
+By having a glance at the output from our full model, we observe how important it was to rightfully set the appropriate reference level in the data processing section. Indeed, we see that there is no coefficient relative to each of the reference level, since they are accounted for in the intercept.
+
+We now compare our full model (*m1*) with our initial model (*m0*) with respect to a likelihood ratio test with the *anova* function. Additionally, we will rely on the AIC and BIC scores to assess if a model is best or not by trying to minimize those values. 
+
+```{r}
+anova(m0 , m1 , test="Chisq")
+AIC(m1); BIC(m1)
+```
+
+The anova test returns a p-value lower than the commonly used 5% threshold, meaning that we reject the simplified model (here *m0*), since we lose to much explicability by doing so. For future use and understanding, note that important metrics are the Null and Residual deviance: 
+$Null Deviance = 2(LL(Saturated Model) - LL(Null Model)) with df = df_Sat - df_Null$ and,
+$Residual Deviance = 2(LL(Saturated Model) - LL(Proposed Model)) with df = df_Sat - df_Proposed$, where LL stands for log-likelihood and df for degree of freedom. 
+
+### Prediction of claim frequencies
+
+We may even go one step further, if we wish to predict future claim frequencies, we use the *predict* function with "response" type. For example, we have computed the first 4 lines of the test set.
+
+```{r}
+predict(m1, head(testing_set, 4), type="response")
+```
+
+Now we have designed a new model *m2*, sometimes called a "Poisson rate model", where we basically divide the amount of claims predicted by the exposure, which gives the claim frequency and if summed, the average claim frequency.
+
+```{r}
+m2 = suppressWarnings(glm(NCLAIMS/EXP ~ COVERAGE + FUEL + SEX + USE+
+                            FLEET+ AGEPH_fac + AGEC_fac + POWER_fac +
+                            BM_fac,
+         data = training_set,
+         weight = training_set$EXP,
+         family = poisson(link = log)))
+summary(m2)
+```
+
+We compare the coefficients from *m1* and *m2* and they are the same. But the difference relies in the different loss functions and how we will treat the y values. It is fair to say that in *m1* Y follows a Poisson distribution but it is not if we state that Y divided by the offset also follow a Poisson distribution. By adjusting the m2 model by adding some weights relative to the exposition, we obtain equivalent coefficients.
+
+```{r}
+cbind(m1$coefficients,m2$coefficients)
+```
+
+Unfortunately, the basic glm implementation is consistent, but there might be some issue since we prepare the data before splitting in a training and testing set. Therefore, when we split, we might have shared information from the training set into the test set before applying the model. This introduces our next section regarding *recipe* function for glm definition and data processing, which we will use for a more reliable development.
+
+### Recipe
+
+Instead of using the *glm* function directly, we can use the *recipe* function instead which aims to make the use of glm simpler, without having to compute the data processing ahead. It also helps to preprocess the data before training our model. We first partition our data into a training and testing set.
+
+```{r}
+set.seed(21)
+in_training = createDataPartition(mtpl_be$NCLAIMS, times = 1, p = 0.8, list = FALSE)
+training_set = mtpl_be[in_training, ]
+testing_set = mtpl_be[-in_training, ]
+```
+
+The recipe function will itself be included in a *workflow* function, which basically defines how the recipe must be handled, alongside with a definition of the model. In the end we fit our workflow with the training set. The first iteration we will make is the standard model with all the variables as argument. We normally do not need to preprocess the data beforehand since it can be done directly within the *recipe* function. But here, we want to test our hypothesis regarding the bins of the continuous variable so we will just do the bins using *step_discretize* function. Unfortunately, we cannot decide where to make the breaks so we will just specify the same amount of breaks we used ourselves. If data were not preprocessed, we would have had to relevel the discrete variables as well, but here we do not.
+
+```{r}
+rec_0 <- recipe(NCLAIMS ~ EXP + COVERAGE + FUEL + SEX + USE+
+                            FLEET+ AGEPH + AGEC + POWER +
+                            BM, data = training_set) %>%
+    step_discretize(AGEPH, num_breaks = 6, min_unique = 2 ) %>%
+    step_discretize(AGEC, num_breaks = 3, min_unique = 2 ) %>%
+    step_discretize(POWER, num_breaks = 5, min_unique = 2 ) %>%
+    step_discretize(BM, num_breaks = 4, min_unique = 2 ) 
+    
+# Modèle Poisson pour fréquence
+m0_mod <- poisson_reg() %>%
+  set_engine("glm")
+
+# Workflow avec offset dans la formule
+m0_wflow <- workflow() %>%
+  add_model(m0_mod, formula = NCLAIMS ~ offset(log(EXP)) + . - EXP) %>% 
+  add_recipe(rec_0)
+
+# Fit
+freq_fit <- fit(m0_wflow, data = training_set)
+summary(extract_fit_engine(freq_fit))
+```
+
+### Cross validation
+
+Now we are looking of different factors of cross-validation by aiming for the smallest mean value and naturally, the lowest standard deviation. It helps us find what are the features to keep and how to bin variables. Moreover, we retrieve the BIC value, as it it one of the most important indicator for feature selection since it penalizes model with respect to the amount of variables.
+
+```{r}
+folds = training_set %>% vfold_cv(strata = NCLAIMS, v = 5)
+res = fit_resamples(m0_wflow,
+                    resamples = folds,
+                    metrics = metric_set(poisson_log_loss))
+collect_metrics(res) %>%
+  mutate(
+    mean = sprintf("%.6f", mean),
+    std_err = sprintf("%.6f", std_err)
+  )
+BIC(extract_fit_engine(freq_fit))
+```
+
+Let's recall that regarding this project, we will use *BIC* and *AIC* to assess the in-sample quality of our model. Besides, we will run a *cross validation* test to assess the out-of-sample performance. Note that for these tests, we always try to minimize their value in the aim of the most optimal model. Finally, the *anova* test helps us decide if a simplified model is preferable over a more complex one as well. The *rec0* model will thus serve as reference model, mainly for the anova test.
+
+We wanted to further test our model to see the efficiency and usefulness of the continuous variable in the model by computing a recipe with only the categorical variables. The results from our comparison test will be summarized in a data frame at the end of this section, but we can already observe that this simplified model is not optimal, mainly due to the score of the anova test (\<0.05). Thus we will stick with model *rec0*
+
+```{r}
+
+m1_mod = poisson_reg() %>%
+  set_engine("glm")
+
+rec_1 <- recipe(NCLAIMS ~ EXP + COVERAGE + FUEL + SEX + USE+
+                            FLEET, data = training_set) 
+    
+   
+m1_wflow <- 
+  workflow() %>% 
+  add_recipe(rec_1) %>%
+  add_model(m1_mod, formula = NCLAIMS ~ offset(log(EXP))+ . - EXP) # Formula of the model
+  
+m1_wflow
+
+m1_fit <- fit(m1_wflow, data = training_set)
+summary(extract_fit_engine(m1_fit))
+BIC(extract_fit_engine(m1_fit))
+anova(extract_fit_engine(freq_fit), extract_fit_engine(m1_fit), test="Chisq")
+#max(abs(predict(m1_fit, testing_set) - predict(m1_bis, testing_set, type="response")))
+
+res = fit_resamples(m1_wflow,
+                    resamples = folds,
+                    metrics = metric_set(poisson_log_loss))
+collect_metrics(res) %>%
+  mutate(
+    mean = sprintf("%.6f", mean),
+    std_err = sprintf("%.6f", std_err)
+  )
+```
+
+Now we do the same by including our continuous variables that we pre-processed ourselves in the previous section, which gives us the following output. Here we test whether the discretization method included in recipe to bin continuous variable is more or less effective than the manual bins we have computed. An anova test is not relevant since we have the same amount of variables, but we clearly observe that our binning techniques provides better scores in terms of AIC, Cross-validation and lowest residual deviance. As of now, we will used the *rec_2* model as reference for comparison.
+
+```{r}
+m2_mod = poisson_reg() %>%
+  set_engine("glm")
+
+rec_2 <- recipe(NCLAIMS ~ EXP + COVERAGE + FUEL + SEX + USE+
+                            FLEET+ AGEPH_fac + AGEC_fac + POWER_fac +
+                            BM_fac , data = training_set)
+    
+m2_wflow <- 
+  workflow() %>% 
+  add_recipe(rec_2) %>%
+  add_model(m2_mod, formula = NCLAIMS ~ offset(log(EXP))+. - EXP ) # Formula of the model
+  
+m2_wflow
+
+m2_fit <- fit(m2_wflow, data = training_set)
+summary(extract_fit_engine(m2_fit))
+BIC(extract_fit_engine(m2_fit))
+
+res = fit_resamples(m2_wflow,
+                    resamples = folds,
+                    metrics = metric_set(poisson_log_loss))
+collect_metrics(res) %>%
+  mutate(
+    mean = sprintf("%.6f", mean),
+    std_err = sprintf("%.6f", std_err)
+  )
+```
+
+What we can observe from the comparison between *rec_0* and *rec_2* is that the AIC, residual deviance and out-of-sample performance are better for our binning technique. On the other hand, the BIC is lower but only by 2 units. Therefore, we decide to go with our binned variables from the first part of this project and use it as base model.
+
+### Interaction
+
+We may as well include some interaction between the explicative variables by adding them in the workflow directly. Here we have found various interaction from which we wanted to investigate the impact on the model. These interactions are between Fuel and the Power of vehicles, the age of policyholder's compare to their bonus-malus level and finally the interaction between the coverage and the bonus-malus level.
+
+```{r}
+rec_3 <- recipe(NCLAIMS ~ EXP + COVERAGE + FUEL + SEX + USE+
+                            FLEET+ AGEPH_fac + AGEC_fac + POWER_fac +
+                            BM_fac , data = training_set)
+    
+m3_wflow <- 
+  workflow() %>% 
+  add_recipe(rec_3) %>%
+  add_model(m2_mod, formula = NCLAIMS ~ offset(log(EXP))
+              + FUEL*POWER_fac + AGEPH_fac*BM_fac + COVERAGE*BM_fac+ . - EXP ) # Formula of the model
+  
+m3_wflow
+
+m3_fit <- fit(m3_wflow, data = training_set)
+summary(extract_fit_engine(m3_fit))
+BIC(extract_fit_engine(m3_fit))
+
+
+```
+
+First, let's remark that most coefficients that were significative prior to this new model, are not anymore. Additionnally, the BIC went up drastically compared to the one from our original model. Let's perform the cross validation test to see if there is a significant difference with our original model, with a better out-of-sample performance.
+
+```{r}
+folds = training_set %>% vfold_cv(strata = NCLAIMS, v = 5)
+res = fit_resamples(m3_wflow,
+                    resamples = folds,
+                    metrics = metric_set(poisson_log_loss))
+collect_metrics(res) %>%
+  mutate(
+    mean = sprintf("%.6f", mean),
+    std_err = sprintf("%.6f", std_err)
+  )
+```
+
+The cross validation test also shows poorer results, which is not really to be taken into account since the standard error is large enough to largely include the cross validation result from *rec_2* in a 95% confidence interval. But we cannot define the extended model as better, especially with the conclusions based on the summary.
+
+To achieve our objective properly by assessing every possible model, we test another model but where we only keep one interaction, namely FUEL\*POWER.
+
+```{r}
+rec_4 <- recipe(NCLAIMS ~ EXP + COVERAGE + FUEL + SEX + USE+
+                            FLEET+ AGEPH_fac + AGEC_fac + POWER_fac +
+                            BM_fac , data = training_set) 
+    
+   
+m4_wflow <- 
+  workflow() %>% 
+  add_recipe(rec_4) %>%
+  add_model(m2_mod, formula = NCLAIMS ~ offset(log(EXP)) 
+              + FUEL*POWER_fac + . - EXP) # Formula of the model
+  
+m4_wflow
+
+m4_fit <- fit(m4_wflow, data = training_set)
+summary(extract_fit_engine(m4_fit))
+BIC(extract_fit_engine(m4_fit))
+
+
+```
+
+Here again, we observe a higher AIC and BIC value, as well as a many coefficients becoming non significative with the introduction of the interaction. Moreover, the cross validation results do not show an outstanding difference. Therefore, we will stick with the initial model without any interactions.
+
+```{r}
+folds = training_set %>% vfold_cv(strata = NCLAIMS, v = 5)
+res = fit_resamples(m4_wflow,
+                    resamples = folds,
+                    metrics = metric_set(poisson_log_loss))
+collect_metrics(res) %>%
+  mutate(
+    mean = sprintf("%.6f", mean),
+    std_err = sprintf("%.6f", std_err)
+  )
+```
+
+### Model without interaction
+
+Let's remember the model we chose based on our previous computations:
+
+```{r}
+summary(extract_fit_engine(m2_fit))
+BIC(extract_fit_engine(m2_fit))
+```
+
+Interactions are one thing, but it is equally important to get rid of useless variables with no explanatory use. We thus rely on function *step_mutate* to merge two intervals appearing to have the same behavior and remove non-significant variables. Let's start by merging together the two factors from COVERAGE since FO is not significant and that the estimate is close to *PO*.
+
+```{r}
+rec_5 <- recipe(NCLAIMS ~ EXP + COVERAGE + FUEL + SEX + USE+
+                            FLEET+ AGEPH_fac + AGEC_fac + POWER_fac +
+                            BM_fac , data = training_set) %>%
+    step_mutate(COVERAGE = forcats::fct_collapse(COVERAGE, "All" = c("PO","FO")))
+   
+
+m5_wflow <- 
+  workflow() %>% 
+  add_recipe(rec_5) %>%
+  add_model(m2_mod, formula = NCLAIMS ~ offset(log(EXP)) + . - EXP) # Formula of the model
+  
+m5_wflow
+
+m5_fit <- fit(m5_wflow, data = training_set)
+summary(extract_fit_engine(m5_fit))
+BIC(extract_fit_engine(m5_fit))
+
+anova(extract_fit_engine(m2_fit), extract_fit_engine(m5_fit), test ="Chisq")
+
+folds = training_set %>% vfold_cv(strata = NCLAIMS, v = 5)
+res = fit_resamples(m5_wflow,
+                    resamples = folds,
+                    metrics = metric_set(poisson_log_loss))
+collect_metrics(res) %>%
+  mutate(
+    mean = sprintf("%.6f", mean),
+    std_err = sprintf("%.6f", std_err)
+  )
+```
+
+We obtain satisfactory results as the AIC remains the same but BIC is reduced by 10. Furthermore, the anova test cannot enable us to reject the hypothesis that additional coefficients cannot be 0. Unfortunately, the cross validation results perform worse than the basic model, but we will rely on the improvements in the other elements.
+
+Now, we also merge together the different car's ages intervals since they appear not being significant in our previously simplified model.
+
+```{r}
+rec_6 <- recipe(NCLAIMS ~ EXP + COVERAGE + FUEL + SEX + USE+
+                            FLEET+ AGEPH_fac + AGEC_fac + POWER_fac +
+                            BM_fac , data = training_set) %>%
+  step_mutate(COVERAGE = forcats::fct_collapse(COVERAGE, "All" = c("PO","FO")))%>%
+  step_mutate(AGEC_fac = forcats::fct_collapse(AGEC_fac, "All" = c("(5,9]","(9,48]")))
+
+m6_wflow <- 
+  workflow() %>% 
+  add_recipe(rec_6) %>%
+  add_model(m2_mod, formula = NCLAIMS ~ offset(log(EXP)) + . - EXP) # Formula of the model
+  
+m6_wflow
+
+m6_fit <- fit(m6_wflow, data = training_set)
+summary(extract_fit_engine(m6_fit))
+BIC(extract_fit_engine(m6_fit))
+
+anova(extract_fit_engine(m2_fit), extract_fit_engine(m6_fit), test ="Chisq")
+
+
+folds = training_set %>% vfold_cv(strata = NCLAIMS, v = 5)
+res = fit_resamples(m5_wflow,
+                    resamples = folds,
+                    metrics = metric_set(poisson_log_loss))
+collect_metrics(res) %>%
+  mutate(
+    mean = sprintf("%.6f", mean),
+    std_err = sprintf("%.6f", std_err)
+  )
+```
+
+Here again, our model performs even better in terms of AIC, BIC and the anova test also supports the simplest model while making the coefficient significant.
+
+Hereafter, we want to remove the coefficient relative to *USE* as it is not significant and does not appear to add any value to the model. Note that it is an hypothesis already supported in our data exploration section, resulting in a lower BIC and anova test supporting this simplified model as well, without the USE variable.
+
+```{r}
+rec_7 <- recipe(NCLAIMS ~ EXP + COVERAGE + FUEL + SEX +
+                            FLEET+ AGEPH_fac + AGEC_fac + POWER_fac +
+                            BM_fac , data = training_set) %>%
+  step_mutate(COVERAGE = forcats::fct_collapse(COVERAGE, "All" = c("PO","FO")))%>%
+  step_mutate(AGEC_fac = forcats::fct_collapse(AGEC_fac, "All" = c("(5,9]","(9,48]")))
+ 
+
+m7_wflow <- 
+  workflow() %>% 
+  add_recipe(rec_7) %>%
+  add_model(m2_mod, formula = NCLAIMS ~ offset(log(EXP)) + . - EXP) # Formula of the model
+  
+m7_wflow
+
+m7_fit <- fit(m7_wflow, data = training_set)
+summary(extract_fit_engine(m7_fit))
+BIC(extract_fit_engine(m7_fit))
+
+anova(extract_fit_engine(m2_fit), extract_fit_engine(m7_fit), test ="Chisq")
+
+
+folds = training_set %>% vfold_cv(strata = NCLAIMS, v = 5)
+res = fit_resamples(m7_wflow,
+                    resamples = folds,
+                    metrics = metric_set(poisson_log_loss))
+collect_metrics(res) %>%
+  mutate(
+    mean = sprintf("%.6f", mean),
+    std_err = sprintf("%.6f", std_err)
+  )
+```
+
+Finally, to have only but significant coefficients, we need to deal with the non-significant ones from policyholders' age categories (AGEPH). Since the interval (43.7,56.5] and (82.2,95.1] do not have a behavior close to one another, we will simply try to include the categories into the reference level. Indeed, it slightly biases the estimate of the intercept, but only by a small value since the coefficient goes from -2.19662 in *rec_7* to -2.20643 in *rec_8* and remains significant. Finally, we can conclude that the model related in *rec_8* is the most optimal as all the coefficients are significant, the AIC and BIC perform better than any other model and the anova test leads us to choose the simplified model. Regarding the results from the cross-validation test, they perform slightly poorer, but score a lower standard deviation, which thus is better in term of uncertainty related to the model out-of-sample performance. Besides, the cross validation results from all the different tests only vary by a $10^{-4}$ value.
+
+```{r}
+rec_8 <- recipe(NCLAIMS ~ EXP + COVERAGE + FUEL + SEX +
+                            FLEET+ AGEPH_fac + AGEC_fac + POWER_fac +
+                            BM_fac , data = training_set) %>%
+  step_mutate(COVERAGE = forcats::fct_collapse(COVERAGE, "All" = c("PO","FO")))%>%
+  step_mutate(AGEC_fac = forcats::fct_collapse(AGEC_fac, "All" = c("(5,9]","(9,48]"))) %>%
+  step_mutate(AGEPH_fac= forcats :: fct_collapse(AGEPH_fac, "rest" = c("(43.7,56.5]", "(82.2,95.1]","(30.8,43.7]")))%>%
+  step_relevel(AGEPH_fac, ref_level = "rest")
+
+m8_wflow <- 
+  workflow() %>% 
+  add_recipe(rec_8) %>%
+  add_model(m2_mod, formula = NCLAIMS ~ offset(log(EXP)) + . - EXP) # Formula of the model
+  
+m8_wflow
+
+m8_fit <- fit(m8_wflow, data = training_set)
+summary(extract_fit_engine(m8_fit))
+BIC(extract_fit_engine(m8_fit))
+
+anova(extract_fit_engine(m2_fit), extract_fit_engine(m8_fit), test ="Chisq")
+
+
+folds = training_set %>% vfold_cv(strata = NCLAIMS, v = 5)
+res = fit_resamples(m8_wflow,
+                    resamples = folds,
+                    metrics = metric_set(poisson_log_loss))
+collect_metrics(res) %>%
+  mutate(
+    mean = sprintf("%.6f", mean),
+    std_err = sprintf("%.6f", std_err)
+  )
+```
+
+Let's build a dataframe gathering all those metrics acquired with our computation.
+
+```{r}
+rec0<- c("rec0", 100299, 100495, "/", 0.384128,  69947)
+rec1<- c("rec1",  102021, 102089 , "< 2.2e-16" , 0.390671, 71695)
+rec2<- c("rec2", 100292, 100497.3, "/" , 0.383969,  69938)
+rec3<- c("rec3", 100266, 100714.1, "/", 0.383981,  69860)
+rec4<- c("rec4", 100272, 100516.7, "/", 0.383993,  69910)
+rec5<- c("rec5", 100292, 100487.4, 0.1679, 0.384059,  69940)
+rec6<- c("rec6", 100291, 100476.5, 0.2438, 0.384017,  69941)
+rec7<- c("rec7", 100291, 100467.4, 0.1403, 0.384018,  69943)
+rec8<- c("rec8", 100289, 100445.6, 0.2025, 0.383995,  69945)
+m <- matrix(data = rbind(rec0, rec1, rec2, rec3, rec4, rec5, rec6, rec7, rec8),nrow = 9, ncol = 6)
+df_freq <- data.frame(m)
+colnames(df_freq) <- c("Model", "AIC", "BIC", "Anova", "CV", "Residual Deviance")
+df_freq
+```
+
+Based on these results, we see that the *rec_8* model stands out and is the most preferable option.
+
+## Severity model (Log-Gamma)
+
+We will in this section explore a GLM based severity model and try to find underlying pattern and the best explanatory variables. We start by remodelling our data set to only consider number of claims superior or equal to 1, and get rid of the years without claims (NAs). We do not forget to partition the data to properly compute under recipe and workflows functions. In this scenario, average claim amount will be assumed to follow a log-Gamma distribution. Based on the assumptions from the previous section on frequency models, we used the bins for continuous variables that we computed ourselves in the first section.
+
+```{r}
+dataset <- mtpl_be %>% filter(NCLAIMS>0)
+set.seed(42)  # For reproducibility
+in_training = createDataPartition(dataset$AVG, times = 1, p = 0.8, list = FALSE)
+training_set = dataset[in_training, ]
+testing_set = dataset[-in_training, ]
+hist(dataset$NCLAIMS)
+```
+
+```{r}
+sev0 <- recipe(AVG ~ COVERAGE + FUEL + SEX + USE + FLEET + AGEPH_fac +
+                 AGEC_fac + POWER_fac + BM_fac, data = training_set)
+
+s0_mod <- linear_reg() %>%
+  set_engine("glm", family = Gamma(link = "log"))
+
+s0_wflow <- 
+  workflow() %>% 
+  add_model(s0_mod, formula = AVG ~ . ) %>% # Formula of the model
+  add_recipe(sev0)
+
+s0_fit <- fit(s0_wflow, data = training_set)
+summary(extract_fit_engine(s0_fit))
+
+resS0 = fit_resamples(s0_wflow,
+                    resamples = folds,
+                    metrics = metric_set(rmse, mae))
+collect_metrics(resS0) %>%
+  mutate(
+    mean = sprintf("%.6f", mean),
+    std_err = sprintf("%.6f", std_err)
+  )
+BIC(extract_fit_engine(s0_fit))
+
+```
+
+The early conclusion we can made based on the summary of our base model above is that no coefficient seems to be significant to predict the average claim amount, except maybe for horsepower. When we take a deeper look at what we are trying to predict, it seems fair that none of these information do have a link or influence on the claim amount, or at least have a direct relationship. So far we only find medium Power range being (barely) significant. Let's now try to add some interactions which might help with our model.
+
+```{r}
+sev1 <- recipe(AVG ~ COVERAGE + FUEL + SEX + USE + FLEET + AGEPH_fac +
+                 AGEC_fac + POWER_fac + BM_fac , data = training_set) 
+
+s1_mod <- linear_reg() %>%
+  set_engine("glm", family = Gamma(link = "log"))
+
+s1_wflow <- 
+  workflow() %>% 
+  add_model(s1_mod, formula = AVG ~ FUEL*POWER_fac + AGEPH_fac*BM_fac + COVERAGE*BM_fac+ . ) %>% # Formula of the model
+  add_recipe(sev1)
+
+s1_fit <- fit(s1_wflow, data = training_set)
+summary(extract_fit_engine(s1_fit))
+
+resS1 = fit_resamples(s1_wflow,
+                    resamples = folds,
+                    metrics = metric_set(rmse, mae))
+collect_metrics(resS1) %>%
+  mutate(
+    mean = sprintf("%.6f", mean),
+    std_err = sprintf("%.6f", std_err)
+  )
+BIC(extract_fit_engine(s1_fit))
+anova(extract_fit_engine(s0_fit), extract_fit_engine(s1_fit), test= "Chisq")
+```
+
+The results from the anova test with respect to the extended model with interaction cannot reject the hypothesis of all additional coefficients to be 0. We thus prefer the simplified model.
+
+Besides, we further recompute an extended model in *sev2* but with only the interaction of Sex and Power of the vehicle, which returns an anova p-value under 5%. Therefore, we go for the extended model.
+
+```{r}
+sev2 <- recipe(AVG ~ COVERAGE + FUEL + SEX + USE + FLEET + AGEPH_fac +
+                 AGEC_fac + POWER_fac + BM_fac , data = training_set) 
+
+s2_mod <- linear_reg() %>%
+  set_engine("glm", family = Gamma(link = "log"))
+
+s2_wflow <- 
+  workflow() %>% 
+  add_model(s2_mod, formula = AVG ~  SEX * POWER_fac+ . ) %>% # Formula of the model
+  add_recipe(sev2)
+
+s2_fit <- fit(s2_wflow, data = training_set)
+summary(extract_fit_engine(s2_fit))
+
+resS2 = fit_resamples(s2_wflow,
+                    resamples = folds,
+                    metrics = metric_set(rmse, mae))
+collect_metrics(resS2) %>%
+  mutate(
+    mean = sprintf("%.6f", mean),
+    std_err = sprintf("%.6f", std_err)
+  )
+BIC(extract_fit_engine(s2_fit))
+
+```
+
+If we look at the cross validation results to determine the prediction performance of the extended models with interaction, we see that their performance is poorer. We will thus continue further with an interactionless model.
+
+Clearly, doing so step-by-step while no coefficient is ever significant, we will first evaluate if a model with only the intercept might be a good solution with respect to the anova test. If not, we will do the step by step iteration and aim for the best performance indicators and best highest anova p-value.
+
+```{r}
+sev_I <- recipe(AVG ~ COVERAGE + FUEL + FLEET + USE + SEX +  AGEPH_fac +
+                 AGEC_fac + POWER_fac + BM_fac , data = training_set) 
+ 
+
+sI_mod <- linear_reg() %>%
+  set_engine("glm", family = Gamma(link = "log"))
+
+sI_wflow <- 
+  workflow() %>% 
+  add_model(sI_mod, formula = AVG ~ 1  ) %>% # Formula of the model
+  add_recipe(sev_I)
+
+sI_fit <- fit(sI_wflow, data = training_set)
+summary(extract_fit_engine(sI_fit))
+
+resSI = fit_resamples(sI_wflow,
+                    resamples = folds,
+                    metrics = metric_set(rmse, mae))
+collect_metrics(resSI) %>%
+  mutate(
+    mean = sprintf("%.6f", mean),
+    std_err = sprintf("%.6f", std_err)
+  )
+BIC(extract_fit_engine(sI_fit))
+anova(extract_fit_engine(s0_fit), extract_fit_engine(sI_fit), test= "Chisq")
+```
+
+Clearly the in-sample metrics perform poorly but regarding cross validation, the out-of-sample performance is much better. Additionally, the anova tests, reject the hypothesis that the coefficients withdrawn are equal to 0. Therefore, at least one of them must be important. Now we will iteratively remove arguments to find the model with optimal metrics. First we will remove coefficient that appear the least relevant based on their significance. We start by removing the *USE* and *FLEET* arguments.
+
+```{r}
+sev3 <- recipe(AVG ~ COVERAGE + FUEL + AGEPH_fac + SEX +
+                 AGEC_fac + POWER_fac + BM_fac , data = training_set) 
+
+s3_mod <- linear_reg() %>%
+  set_engine("glm", family = Gamma(link = "log"))
+
+s3_wflow <- 
+  workflow() %>% 
+  add_model(s3_mod, formula = AVG ~  . ) %>% # Formula of the model
+  add_recipe(sev3)
+
+s3_fit <- fit(s3_wflow, data = training_set)
+summary(extract_fit_engine(s3_fit))
+
+resS3 = fit_resamples(s3_wflow,
+                    resamples = folds,
+                    metrics = metric_set(rmse, mae))
+collect_metrics(resS3) %>%
+  mutate(
+    mean = sprintf("%.6f", mean),
+    std_err = sprintf("%.6f", std_err)
+  )
+BIC(extract_fit_engine(s3_fit))
+
+anova(extract_fit_engine(s0_fit), extract_fit_engine(s3_fit), test= "Chisq")
+```
+
+Unfortunately, we did not make any step forward in terms of coefficients that are significant but the anova test shows that we should choose the simplified model. Next, we remove *SEX*.
+
+```{r}
+sev4 <- recipe(AVG ~  FUEL  + AGEPH_fac + COVERAGE +
+                 AGEC_fac + POWER_fac + BM_fac , data = training_set)
+
+s4_mod <- linear_reg() %>%
+  set_engine("glm", family = Gamma(link = "log"))
+
+s4_wflow <- 
+  workflow() %>% 
+  add_model(s4_mod, formula = AVG ~ . ) %>% # Formula of the model
+  add_recipe(sev4)
+
+s4_fit <- fit(s4_wflow, data = training_set)
+summary(extract_fit_engine(s4_fit))
+
+resS4 = fit_resamples(s4_wflow,
+                    resamples = folds,
+                    metrics = metric_set(rmse, mae))
+collect_metrics(resS4) %>%
+  mutate(
+    mean = sprintf("%.6f", mean),
+    std_err = sprintf("%.6f", std_err)
+  )
+BIC(extract_fit_engine(s4_fit))
+
+anova(extract_fit_engine(s0_fit), extract_fit_engine(s4_fit), test= "Chisq")
+anova(extract_fit_engine(s3_fit), extract_fit_engine(s4_fit), test= "Chisq")
+```
+
+It appears that removing the SEX factors make the model perform worse than *sev3*. Instead, we will add SEX back and remove Coverage.
+
+```{r}
+sev5 <- recipe(AVG ~ FUEL + SEX +  AGEPH_fac +
+                 AGEC_fac + POWER_fac + BM_fac , data = training_set) 
+ 
+
+s5_mod <- linear_reg() %>%
+  set_engine("glm", family = Gamma(link = "log"))
+
+s5_wflow <- 
+  workflow() %>% 
+  add_model(s5_mod, formula = AVG ~ . ) %>% # Formula of the model
+  add_recipe(sev5)
+
+s5_fit <- fit(s5_wflow, data = training_set)
+summary(extract_fit_engine(s5_fit))
+
+resS5 = fit_resamples(s5_wflow,
+                    resamples = folds,
+                    metrics = metric_set(rmse, mae))
+collect_metrics(resS5) %>%
+  mutate(
+    mean = sprintf("%.6f", mean),
+    std_err = sprintf("%.6f", std_err)
+  )
+BIC(extract_fit_engine(s5_fit))
+anova(extract_fit_engine(s0_fit), extract_fit_engine(s5_fit), test= "Chisq")
+```
+
+Clearly results are worse than when we add only removed *SEX*. Since adding and removing one coefficient at a time is heavy in computations and fluctuates a lot without us being able to determine a solid pattern, we will make an assumption and remove *COVERAGE*, *SEX*, *FUEL* *USE* and *FLEET* from the base model.
+
+```{r}
+sev6 <- recipe(AVG ~   AGEPH_fac + AGEC_fac + POWER_fac + BM_fac , data = training_set) 
+ 
+
+s6_mod <- linear_reg() %>%
+  set_engine("glm", family = Gamma(link = "log"))
+
+s6_wflow <- 
+  workflow() %>% 
+  add_model(s6_mod, formula = AVG ~ .) %>% # Formula of the model
+  add_recipe(sev6)
+
+s6_fit <- fit(s6_wflow, data = training_set)
+summary(extract_fit_engine(s6_fit))
+
+resS6 = fit_resamples(s6_wflow,
+                    resamples = folds,
+                    metrics = metric_set(rmse, mae))
+collect_metrics(resS6) %>%
+  mutate(
+    mean = sprintf("%.6f", mean),
+    std_err = sprintf("%.6f", std_err)
+  )
+BIC(extract_fit_engine(s6_fit))
+anova(extract_fit_engine(s0_fit), extract_fit_engine(s6_fit), test= "Chisq")
+```
+
+It results a much worse model than we found before. Therefore, we remember than in model *sev_3* we obtained the best indicators so far with *USE* and *FLEET* being removed. We thus start back from that model and this time we will try improving the model by merging factors from same categories together. We merge factors with similar estimates relative to *BM*, *AGEPH* and *AGEC*. Intuitively, we avoid grouping estimates which have opposite effects or which are too different from one another.
+
+```{r}
+sev7 <- recipe(AVG ~ COVERAGE + FUEL + SEX +  AGEPH_fac +
+                 AGEC_fac + POWER_fac + BM_fac , data = training_set) %>%
+  step_mutate(BM_fac = forcats:: fct_collapse(BM_fac,"(5,22]"= c("(5,11]", "(11,22]")))%>%
+  step_mutate(AGEPH_fac = forcats:: fct_collapse(AGEPH_fac,"1"= c("(17.9,30.8]", "(56.5,69.3]")))%>%
+  step_mutate(AGEPH_fac = forcats:: fct_collapse(AGEPH_fac,"2"= c("(43.7,56.5]", "(69.3,82.2]", "(82.2,95.1]")))%>%
+  step_mutate(AGEC_fac = forcats:: fct_collapse(AGEC_fac,"(5,48]"= c("(5,9]", "(9,48]")))
+
+ 
+
+s7_mod <- linear_reg() %>%
+  set_engine("glm", family = Gamma(link = "log"))
+
+s7_wflow <- 
+  workflow() %>% 
+  add_model(s7_mod, formula = AVG ~ . ) %>% # Formula of the model
+  add_recipe(sev7)
+
+s7_fit <- fit(s7_wflow, data = training_set)
+summary(extract_fit_engine(s7_fit))
+
+resS7 = fit_resamples(s7_wflow,
+                    resamples = folds,
+                    metrics = metric_set(rmse, mae))
+collect_metrics(resS7) %>%
+  mutate(
+    mean = sprintf("%.6f", mean),
+    std_err = sprintf("%.6f", std_err)
+  )
+BIC(extract_fit_engine(s7_fit))
+anova(extract_fit_engine(s0_fit), extract_fit_engine(s7_fit), test= "Chisq")
+```
+
+Here we made a leap forward in term of accuracy indicators. Indeed, *sev_7* performs now best in terms of BIC, Anova and MAE. On the other hand, it is slightly worse in terms of AIC, RMSE and residuals deviance. But we tend to give more importance to the BIC and anova tests. Additionally, now two estimates became significant, namely vehicle with horsepower between 55 and 66 and bonus-malus levels between 5 and 22. We performed all the possible merger of categories we could do with respect to our model. As a last resort, we will again, try to remove some inconsistent variables. We thus try to remove *SEX* having the highest p-value for a lone category.
+
+```{r}
+sev8 <- recipe(AVG ~ COVERAGE + FUEL +  AGEPH_fac +
+                 AGEC_fac + POWER_fac + BM_fac , data = training_set) %>%
+  step_mutate(BM_fac = forcats:: fct_collapse(BM_fac,"(5,22]"= c("(5,11]", "(11,22]")))%>%
+  step_mutate(AGEPH_fac = forcats:: fct_collapse(AGEPH_fac,"1"= c("(17.9,30.8]", "(56.5,69.3]")))%>%
+  step_mutate(AGEPH_fac = forcats:: fct_collapse(AGEPH_fac,"2"= c("(43.7,56.5]", "(69.3,82.2]", "(82.2,95.1]")))%>%
+  step_mutate(AGEC_fac = forcats:: fct_collapse(AGEC_fac,"(5,48]"= c("(5,9]", "(9,48]")))
+
+ 
+
+s8_mod <- linear_reg() %>%
+  set_engine("glm", family = Gamma(link = "log"))
+
+s8_wflow <- 
+  workflow() %>% 
+  add_model(s8_mod, formula = AVG ~ . ) %>% # Formula of the model
+  add_recipe(sev8)
+
+s8_fit <- fit(s8_wflow, data = training_set)
+summary(extract_fit_engine(s8_fit))
+
+resS8 = fit_resamples(s8_wflow,
+                    resamples = folds,
+                    metrics = metric_set(rmse, mae))
+collect_metrics(resS8) %>%
+  mutate(
+    mean = sprintf("%.6f", mean),
+    std_err = sprintf("%.6f", std_err)
+  )
+BIC(extract_fit_engine(s8_fit))
+anova(extract_fit_engine(s0_fit), extract_fit_engine(s8_fit), test= "Chisq")
+```
+
+Results only got worse, therefore we will stick with model *sev_7* with respect to severity. 
+
+Let's build a dataframe gathering all those metrics acquired with our computation.
+
+```{r}
+s0<- c("sev0", 239017, 239183.8, "/", 1829.36, 13358.07, 35636)
+s1<- c("sev1",  238624 , 238858.9, 0.0003305, 1845.3, 13198.3, 34879)
+s2<- c("sev2", 238656, 238853.2, "/" , 1839.46, 13375.08, 34956)
+sI <- c("sevI", 239784, 239799.2, 0.01278 , 1806.72, 13348.12, 37162) #intercept
+s3<- c("sev3", 239030, 239182.1, 0.6766, 1828.71, 13357.96, 35668) #remove USE and Fleet
+s4<- c("sev4", 239041, 239184.9, 0.7212, 1830.28, 13357.85, 35691) #remove sex
+s5<- c("sev5", 239122, 239258.8, 0.2801, 1827.92, 13358.63, 35847) #add sex and remove cov
+s6<- c("sev6", 239177, 239298.2, 0.2607, 1829.2, 13358.4, 35956) #w/o Cov, sex, use, fleet, fuel
+s7<- c("sev7", 239036, 239149.7, 0.9831, 1826.47, 13358.29, 35697) # merge BM, AGEPH and AGEC
+s8 <- c("sev8", 239047, 239152.9, 0.9796, 1828.35, 13358.37, 35721) # remove SEX
+m <- matrix(data = rbind(s0, s1, s2, sI, s3, s4, s5, s6, s7, s8),nrow = 10, ncol = 7)
+df_sev <- data.frame(m)
+colnames(df_sev) <- c("Model", "AIC", "BIC", "Anova", "MAE", "RMSE", "Residual Deviance")
+df_sev
+```
+
+### Report results
+
+Resulting from our analysis regarding the frequency (Poisson) and severity (Gamma) models, here is what we conclude. While most main effects, without interaction, have a significant effect on the frequency of claims, we cannot say the same for the severity model. Indeed, most if not all the coefficients are not considered significant. This can be easily explained by the idea that no feature corresponding to a policyholder or policy might indicate the severity of a claim, being mainly circumstantial.
+
+Let's first develop the final model regarding the frequency, namely *rec_8*. We achieve all coefficients in the model to be significant while obtaining optimal performance indicators. They are the following :
+
+```{r}
+df_freq[9,]
+summary(extract_fit_engine(m8_fit))
+```
+
+AIC accounting from in-sample performance and out-of-sample deviance is frequently used to assess model complexity and fit but is not the best since it does not penalize the model for having more coefficients. The more arguments, the more precise will the model be, even though the additional arguments are not that relevant. BIC remedies to this issue by penalizing the model depending on the number of arguments: $-2ln(L) + k\times ln(N)$, where L is the likelihood of the model, N is the number of observation in the sample and k is the number of parameters. Besides, the anova test shows that this simplified model is preferred to the more complex initial one. To obtain our final model, we removed the *USE* argument and merged *COVERAGE*, *AGEC* and *AGEPH*. Lastly, we compared cross-validation results to evaluate model stability and predictive performance and the model performed 3rd, but by only few $10^{-6}$ and therefore did not penalize it regarding this indicator.
+
+The Poisson GLM is estimated with the exposure as offset, so all coefficients are interpreted as multiplicative effects on the claim frequency, holding exposure constant and relative to their respective reference categories.
+
+The intercept corresponds to the baseline log–claim frequency for a policyholder in all reference categories (*TPL* coverage, *diesel* fuel, *male*, *non-fleet* use, policyholder aged between 31 and 56 years old, car age between 0 and 5, *lowest power* class and *lowest bonus–malus* level). The exponential of the intercept gives the baseline (reference level) expected claim frequency per unit of exposure, being equal to a claim frequency of 11%. Hereunder, we define how the claim frequency evolves with respect to particular characteristics.
+
+**Coverage** type has a statistically significant effect: policies with PO and FO (All) coverage exhibit a lower claim frequency than the reference coverage (TPL), with an estimated decrease of about 5.6%. It suggests a more cautious behavior or stronger underwriting selection. Vehicles running on **gasoline** have a substantially lower expected claim frequency (around 16% less) compared to *diesel* running vehicles, indicating a materially safer risk profile. **Female** policyholders display a slightly higher claim frequency (approximately +4.4%) compared to males, although the magnitude of the effect remains modest despite statistical significance. **Fleet** vehicles are associated with a significantly lower claim frequency (around −14%), which may reflect professional use, structured driving patterns or stronger risk management.
+
+**Policyholder age (AGEPH)** shows a pronounced and non-linear relationship with claim frequency. Compared to the reference age group, younger drivers (17.9–30.8 years) have a significantly higher claim frequency (approximately +20%), while older drivers (56.5–69.3 and 69.3–82.2 years) exhibit substantially lower frequencies (around −19% to −21%). This pattern is consistent with well-documented life-cycle effects in motor insurance risk.
+
+**Vehicle age (AGEC)** also contributes positively to claim frequency: cars older than 5 years have an estimated increase of about 4.3% relative to the reference group 0 to 5, indicating slightly higher risk for older or non-baseline vehicles. **Engine power** displays a clear monotonic effect: higher power classes are associated with progressively higher claim frequencies, ranging from roughly +9% for moderate power vehicles to more than +22% for the highest power class, reflecting increased driving intensity or risk-taking behavior.
+
+Finally, the **bonus–malus (BM)** factor emerges as the strongest predictor in the model. Relative to the level 0, higher BM levels correspond to sharply increasing claim frequencies, with effects ranging from approximately +25% up to more than +125% for levels between 12 and 22. This confirms the strong persistence of individual risk and the high predictive power of past claims experience.
+
+On the other hand, we dealt with the severity model which, as said in the beginning of this section, brought up more challenge in interpretation. Claim severity is not directly impacted by any of the information retrieved from the different policies. As a result, no coefficient other than the intercept were significant. We still tried to process the model by making it as simple as it can. A model with only the intercept was not possible due the p-value of the anova test being lower than the 5% threshold. After numerous iteration, we obtain a relatively optimal model with following results and coefficients.
+
+```{r}
+df_sev[9,]
+summary(extract_fit_engine(s7_fit))
+```
+
+Interestingly enough, narrowing down the coefficients did not made them all significant, but two of them appeared to be: *POWER_fac(55,66]* and *BM_fac(5,22]*. We could not narrow them down further due to a noticeable increase in the performance indicators. Removing the coefficients which were not significant only increase indicators as well and even worsen the significance of the two parameters. We thus decided to stick to this mixed model. Meanwhile, our model scored best in BIC, ANOVA and MAE testing.
+
+Analyzing significant coefficient is a bit less straightforward in this case since most of them are not. The average claim amount for a policy corresponding to the reference level has an **average claim of 1105,44**. This prediction can be assumed to all the other non-significant factors as well. But for the two significant characteristics, we observe that vehicle with horsepower between 56 and 66 kilowatts tend to increase the severity by 42%. It is surprising that the same effect has not been observed for even higher horsepower though. Furthermore, for policyholders sitting between level 6 and 22 on the bonus-malus ladder increase the severity by 39%.
+
+Below, we computed insurance premiums as a function of the policyholder's age and its level on the bonus-malus scale. To properly calculate the premium, we have thus fixed all other characteristics to the reference level, knowingly a man driving a diesel car younger than 5 years old with horsepower lower than 40kw. The car is for private use and is not part of a fleet, while being covered under Third Party policy (TPL). Let's recall that the insurance premium is computed with: $Premium_i = Frequency_i \times Severity_i$ with i being the specific condition to each policyholder. We only have one factor influencing severity, which is for policyholders in levels higher than 5 in the bonus-malus scale with a multiplicator level equal to $exp(0.328594)$. Then with respect to frequency, we add multiplicator coefficient depending on age and level on the bonus-malus ladder.
+
+```{r}
+# Reference level with BM=0 and AGEPH [31,43]
+r0 <- exp(-2.20643)*exp(7.008294)
+
+# BM = 0
+pi_11 <- r0 * exp(0.18384)  #AGE [18,30]
+pi_12 <- r0                 #AGE [31,43]
+pi_13 <- r0                 #AGE [44,56]
+pi_14 <- r0 * exp(-0.21384) #AGE [57,69]
+pi_15 <- r0 * exp(-0.23635) #AGE [70,82]
+pi_16 <- r0                 #AGE [83,95]
+BM0<- c(pi_11, pi_12, pi_13, pi_14, pi_15, pi_16)
+
+# BM = [1,5]
+pi_21 <- r0 * exp(0.22120 + 0.18384)  #AGE [18,30]
+pi_22 <- r0 * exp(0.22120)            #AGE [31,43]
+pi_23 <- r0 * exp(0.22120)            #AGE [44,56]
+pi_24 <- r0 * exp(0.22120 - 0.21384)  #AGE [57,69]
+pi_25 <- r0 * exp(0.22120 - 0.23635)  #AGE [70,82]
+pi_26 <- r0 * exp(0.22120)            #AGE [83,95]
+BM1<- c(pi_21, pi_22, pi_23, pi_24, pi_25, pi_26)
+
+# BM = [6,11]
+pi_31 <- r0 * exp(0.59481 + 0.18384) * exp(0.328594)  #AGE [18,30]
+pi_32 <- r0 * exp(0.59481) * exp(0.328594)            #AGE [31,43]
+pi_33 <- r0 * exp(0.59481) * exp(0.328594)            #AGE [44,56]
+pi_34 <- r0 * exp(0.59481 - 0.21384) * exp(0.328594)  #AGE [57,69]
+pi_35 <- r0 * exp(0.59481 - 0.23635) * exp(0.328594)  #AGE [70,82]
+pi_36 <- r0 * exp(0.59481)          * exp(0.328594)   #AGE [83,95]
+BM6<- c(pi_31, pi_32, pi_33, pi_34, pi_35, pi_36)
+
+# BM = [12,22]
+pi_41 <- r0 * exp(0.81801 + 0.18384) * exp(0.328594)  #AGE [18,30]
+pi_42 <- r0 * exp(0.81801) * exp(0.328594)            #AGE [31,43]
+pi_43 <- r0 * exp(0.81801) * exp(0.328594)            #AGE [44,56]
+pi_44 <- r0 * exp(0.81801 - 0.21384) * exp(0.328594)  #AGE [57,69]
+pi_45 <- r0 * exp(0.81801 - 0.23635) * exp(0.328594)  #AGE [70,82]
+pi_46 <- r0 * exp(0.81801) * exp(0.328594)            #AGE [83,95]
+BM12<- c(pi_41, pi_42, pi_43, pi_44, pi_45, pi_46)
+
+library(ggplot2)
+
+age_levels <- c(
+  "[18,30]", "[31,43]", "[44,56]",
+  "[57,69]", "[70,82]", "[83,95]"
+)
+
+premium_df <- data.frame(
+  AGEPH = factor(
+    rep(age_levels, times = 4),
+    levels = age_levels
+  ),
+  Premium = c(BM0, BM1, BM6, BM12),
+  BM = factor(
+    rep(c("BM = 0", "BM = [1,5]", "BM = [6,11]", "BM = [12,22]"),
+        each = length(age_levels))
+  )
+)
+
+
+ggplot(premium_df,
+       aes(x = AGEPH, y = Premium, group = BM, color = factor(BM, levels = c(
+    "BM = 0",
+    "BM = [1,5]",
+    "BM = [6,11]",
+    "BM = [12,22]"
+  )))) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2) +
+  scale_color_brewer(palette = "Dark2") +
+  labs(
+    x = "Policyholder age interval",
+    y = "Insurance premium*",
+    color = "Bonus–Malus levels",
+    title = "Insurance premium by age and Bonus–Malus level",
+    caption = "*Premium expressed in euros"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.caption = element_text(
+    size = 9,
+    hjust = 0,     # left aligned
+    margin = margin(t = 10)
+    ),
+    legend.position = "right",
+    axis.text.x = element_text(angle = 0)
+  )+
+  theme_gray()
+
+```
+
+On the plot, we may observe the difference in insurance premiums depending on the position of the policyholder on the bonus-malus scale and with respect to his age for the reference level. It is fair to assume than the lower in the scale you are positioned, the less risk you represent to the insurer and the less you should pay as an insured. This is mainly influence by the severity multiplicator that increases massively for levels 6 to 22, which explains the huge gap in price between the lowest and highest levels. Moreover, we observe the same intuitive pattern we observe in the data exploration section regarding policyholder's age. Younger driver represent more risk and thus pay higher premium. The older the insured the less risk it represents for the insurer, except an upward movement for older ages, which can be explained by more claims caused by elderlies. This plot actually gives us a good intuition of the behavior of insurance premium regarding bonus-malus scale and age but is a bit to extreme in the differences among the different categories. That can be explained mainly by the continuous variable management in GLM models. Indeed there is a need for them to be discretized and factorized, but it is complex to find an optimal discretization step to fully reflect the information carried by those continuous variables. By smoothing this discretization, we could obtain more representative and accurate pricing for each policyholders. In the following section, we will apply GAM models as a solution to this issue regarding continuous variables management.
+
+# GAM models
+
+```{r}
+require("mgcv")
+require("plyr")
+require("ggplot2")
+require("gridExtra")
+if (!require("parallel")) install.packages("parallel")
+require("parallel")
+require("arrow")
+require("tidymodels")
+```
+
+Before getting started with GAMs, it is important to understand that it is a model based on GLMs, which is specifically made to deal with continuous variables. More specifically, we will use the continuous variables used in our GLM models and will add two more, long and lat, accounting for the longitude and latitude where the policyholder resides. To properly include continuous variables, GAMs use a smoothing function *s()*. As evoked, we will deal with longitude and latitude information from each policyholder and need to include this information into our GAM as well. To this end, we may use a bivariate function $f(long,lat)$ to account for the spatial metrics. There is two possible smoothing functions that might be used for bivariate functions, s or te, but we will use *s( ,by="tp")* as it is more suited for for quantities measured in same units, such as spatial effects.
+
+## Frequency model with smoothing
+
+Computational time is quite extensive while dealing with gam. Therefore, we will rely on the bam function to lower the time needed while using recipe to fasten the process. For the sake of comparison, we test the two different bivariate smoothing functions, namely *s()* and *te()* to assess which one retrieves the highest Log-likelihood result.
+
+```{r}
+set.seed(21)
+in_training = createDataPartition(mtpl_be$NCLAIMS, times = 1, p = 0.8, list = FALSE)
+training_set = mtpl_be[in_training, ]
+testing_set = mtpl_be[-in_training, ]
+
+require(parallel)
+cl = makeCluster(detectCores() - 1)
+rec <- recipe(NCLAIMS ~ POWER +  COVERAGE + FUEL+ FLEET + USE + SEX + AGEPH + AGEC+ BM + LONG + LAT + EXP, data = training_set)%>%
+  prep()
+
+m_bam = bam(NCLAIMS ~ offset(log(EXP)) +  COVERAGE + FUEL + FLEET + USE + SEX + s(POWER) + s(AGEC) + s(AGEPH) + s(BM) + te(LONG,LAT), data = bake(rec, training_set),
+    family = poisson(link = log), cluster = cl)
+stopCluster(cl)
+logLik.gam(m_bam)
+```
+
+```{r}
+cl = makeCluster(detectCores() - 1)
+rec <- recipe(NCLAIMS ~ POWER +  COVERAGE + FUEL+ FLEET + USE + SEX + AGEPH + AGEC+ BM + LONG + LAT + EXP, data = training_set)%>%
+  prep()
+
+m0_bam = bam(NCLAIMS ~ offset(log(EXP)) +  COVERAGE + FUEL + FLEET + USE + SEX + s(POWER) + s(AGEC) + s(AGEPH) + s(BM) + s(LONG,LAT, bs="tp"), data = bake(rec, training_set),
+    family = poisson(link = log), cluster = cl)
+stopCluster(cl)
+
+logLik.gam(m0_bam)
+
+```
+
+The log-likelihood is thus maximized with the smoothing function *s( ,bs="tp")* and will therefore use it for our following computations
+
+```{r}
+AIC(m0_bam); BIC(m0_bam)
+summary(m0_bam)
+```
+
+At first glance, we can already observe in the summary that continuous variables are being processed differently and that they are all significant. Regarding discrete variables, they all appear highly significant, except for *USE* and *SEX*. As in the previous section regarding GLMs, we use specific performance indicator to assess the accuracy and fit of our models. Naturally, we rely again on the AIC and BIC, but we will reintroduce as well the cross-validation test to properly assess the predictive performance of our GAMs. Here we computed the k-folds cross-validation and will compare the mean of the folds with the ones from other models. Furthermore, we include the maximization of the log-likelihood as performance indicator as well as the adjusted R-squared which evaluates the percentage of the model being explained. Therefore, we aim for higher log-likelihood value and R-squared.
+
+```{r}
+require(caret)
+set.seed(81)
+folds = createFolds(training_set$NCLAIMS, k = 5)
+res0 = lapply(folds, function(X) {
+    cl = makeCluster(detectCores() - 1)  # Number of cores to use
+    m0_bam = bam(NCLAIMS ~ offset(log(EXP)) +  COVERAGE + FUEL + FLEET + USE + SEX + s(POWER) + s(AGEC) + s(AGEPH) + s(BM) + s(LONG,LAT, bs="tp"),
+        data = bake(rec, training_set[-X, ]), family = poisson(link = log), cluster = cl)
+    stopCluster(cl)
+    pred = predict(m0_bam, bake(rec, training_set[X, ]), type = "response")
+    sum(dpois(x = bake(rec, training_set[X, ])$NCLAIMS, lambda = pred, log = TRUE))
+})
+res0
+apply(cbind(unlist(res0)), 2, mean)
+```
+
+A conclusion we can already make, based on this bam reference model with all the variables, is that we get a lower AIC and significantly lower BIC compared to the GLM's. Additionally, Policyholder's age is widely significant in the bam while in the GLM, in was not for ages between 44 and 56 and over 86. *USE* is not significant is both models and finally, the *FO* coverage is significant here but was not in GLM and the opposite for *SEX*.
+
+Let's now get rid of the USE and SEX to assess how it impacts our model.
+
+```{r}
+cl = makeCluster(detectCores() - 1)
+rec1 <- recipe(NCLAIMS ~ POWER +  COVERAGE + FUEL+ FLEET + AGEPH + AGEC+ BM + LONG + LAT + EXP, data = training_set)%>%
+  prep()
+
+m1_bam = bam(NCLAIMS ~ offset(log(EXP)) +  COVERAGE + FUEL + FLEET  + s(POWER) + s(AGEC) + s(AGEPH) + s(BM) + s(LONG,LAT, bs="tp"), data = bake(rec1, training_set),
+    family = poisson(link = log), cluster = cl)
+stopCluster(cl)
+AIC(m1_bam); BIC(m1_bam)
+logLik.gam(m1_bam)
+summary(m1_bam)
+
+anova(m0_bam, m1_bam, test = "Chisq")
+```
+
+When implementing a second model without the *USE* and *SEX* variable, we see that even though we obtain a better BIC, the AIC, Log-likelihood perform poorer. Moreover, the anova test tells us that at least one of the two coefficients removed has a value different than 0. We now implement the same model but we add *SEX* back as it is the coefficient with the lowest p-value of the two in *m0_bam*.
+
+```{r}
+cl = makeCluster(detectCores() - 1)
+rec2 <- recipe(NCLAIMS ~ POWER +  COVERAGE + FUEL+ FLEET + SEX + AGEPH + AGEC+ BM + LONG + LAT + EXP, data = training_set)%>%
+  prep()
+
+m2_bam = bam(NCLAIMS ~ offset(log(EXP)) +  COVERAGE + FUEL + FLEET + s(POWER) + SEX + s(AGEPH) + s(BM) + s(AGEC) + s(LONG,LAT, bs="tp"), data = bake(rec2, training_set),
+    family = poisson(link = log), cluster = cl)
+stopCluster(cl)
+AIC(m2_bam); BIC(m2_bam)
+logLik.gam(m2_bam)
+summary(m2_bam)
+
+anova(m0_bam, m2_bam, test = "Chisq")
+```
+
+Unfortunately, putting back SEX has not made that variable significant. The anova test shows that we can keep this simpler model over m0_bam and BIC supports that stance. On the other hand, Log-likelihood is not maximized and AIC is not improved.
+
+```{r}
+
+set.seed(82)
+folds = createFolds(training_set$NCLAIMS, k = 5)
+res2 = lapply(folds, function(X) {
+    cl = makeCluster(detectCores() - 1)  # Number of cores to use
+    m2_bam = bam(NCLAIMS ~ offset(log(EXP)) +  COVERAGE + FUEL + FLEET + s(POWER) + s(AGEC) + s(AGEPH) + s(BM) + s(LONG,LAT, bs="tp"),
+        data = bake(rec2, training_set[-X, ]), family = poisson(link = log), cluster = cl)
+    stopCluster(cl)
+    pred = predict(m2_bam, bake(rec, training_set[X, ]), type = "response")
+    sum(dpois(x = bake(rec2, training_set[X, ])$NCLAIMS, lambda = pred, log = TRUE))
+})
+
+res2
+apply(cbind(unlist(res0), unlist(res2)), 2, mean)
+```
+
+Cross validation results display better performance for model *m2_bam*. Starting from here, we may explore a possible interaction between SEX and POWER or AGE to analyze if it makes our model more robust.
+
+```{r}
+cl = makeCluster(detectCores() - 1)
+rec3 <- recipe(NCLAIMS ~ POWER +  COVERAGE + FUEL+ SEX+ FLEET + AGEPH + AGEC+ BM +
+                 LONG + LAT + EXP, data = training_set)%>%
+  prep()
+ 
+m3_bam = bam(NCLAIMS ~ offset(log(EXP)) +  COVERAGE + FUEL + FLEET + s(POWER) + s(AGEC) + s(AGEPH, by=SEX) + s(BM) + s(LONG,LAT, bs="tp"), data = bake(rec3, training_set),
+    family = poisson(link = log), cluster = cl)
+stopCluster(cl)
+AIC(m3_bam); BIC(m3_bam)
+logLik.gam(m3_bam)
+summary(m3_bam)
+
+anova(m0_bam, m3_bam, test = "Chisq")
+```
+
+```{r}
+set.seed(82)
+folds = createFolds(training_set$NCLAIMS, k = 5)
+res3 = lapply(folds, function(X) {
+    cl = makeCluster(detectCores() - 1)  # Number of cores to use
+    m3_bam = bam(NCLAIMS ~ offset(log(EXP)) +  COVERAGE + FUEL + FLEET + s(POWER) +
+                   s(AGEC) + s(AGEPH, by=SEX) + s(BM) + s(LONG,LAT, bs="tp"),
+        data = bake(rec3, training_set[-X, ]), family = poisson(link = log), cluster = cl)
+    stopCluster(cl)
+    pred = predict(m3_bam, bake(rec, training_set[X, ]), type = "response")
+    sum(dpois(x = bake(rec3, training_set[X, ])$NCLAIMS, lambda = pred, log = TRUE))
+})
+
+res3
+apply(cbind(unlist(res0), unlist(res3)), 2, mean)
+```
+
+Now we compare with the interaction between SEX and POWER
+
+```{r}
+cl = makeCluster(detectCores() - 1)
+rec4 <- recipe(NCLAIMS ~ POWER +  COVERAGE + FUEL+ SEX+ FLEET + AGEPH + AGEC+ BM +
+                 LONG + LAT + EXP, data = training_set)%>%
+  prep()
+ 
+m4_bam = bam(NCLAIMS ~ offset(log(EXP)) +  COVERAGE + FUEL + FLEET + s(POWER, by=SEX) + s(AGEC) + s(AGEPH) + s(BM) + s(LONG,LAT, bs="tp"), 
+             data = bake(rec4, training_set),
+    family = poisson(link = log), cluster = cl)
+stopCluster(cl)
+AIC(m4_bam); BIC(m4_bam)
+logLik.gam(m4_bam)
+summary(m4_bam)
+
+anova(m0_bam, m4_bam, test = "Chisq")
+```
+
+```{r}
+set.seed(82)
+folds = createFolds(training_set$NCLAIMS, k = 5)
+res4 = lapply(folds, function(X) {
+    cl = makeCluster(detectCores() - 1)  # Number of cores to use
+    m4_bam = bam(NCLAIMS ~ offset(log(EXP)) +  COVERAGE + FUEL + FLEET + s(POWER, by=SEX)
+                 + s(AGEC) + s(AGEPH) + s(BM) + s(LONG,LAT, bs="tp"),
+        data = bake(rec4, training_set[-X, ]), family = poisson(link = log), cluster = cl)
+    stopCluster(cl)
+    pred = predict(m4_bam, bake(rec, training_set[X, ]), type = "response")
+    sum(dpois(x = bake(rec4, training_set[X, ])$NCLAIMS, lambda = pred, log = TRUE))
+})
+
+res4
+apply(cbind(unlist(res0), unlist(res4)), 2, mean)
+```
+We find ourselves in an uneasy situation since the interaction between SEX and Age performs better in all aspects, except for a much poorer performance in terms of BIC. But we conclude that although the BIC is higher, the AIC suggests that *m3_bam* has additional parameters that genuinely improve fit beyond just adding complexity. 
+
+let's now merge the coefficients from Coverage taking approximately the same value to simplify our model.
+
+```{r}
+cl = makeCluster(detectCores() - 1)
+rec5 <- recipe(NCLAIMS ~ POWER +  COVERAGE + FUEL+ SEX + FLEET + AGEPH + AGEC+ BM + LONG
+               + LAT + EXP, data = training_set)%>%
+  step_mutate(COVERAGE = forcats::fct_collapse(COVERAGE, "(PO,FO)" = c("PO","FO")))%>%
+  prep()
+ 
+m5_bam = bam(NCLAIMS ~ offset(log(EXP)) +  COVERAGE + FUEL + FLEET + s(POWER) +
+               s(AGEC) + s(AGEPH, by=SEX) + s(BM) + s(LONG,LAT, bs="tp"),
+             data = bake(rec5, training_set), family = poisson(link = log), cluster = cl)
+stopCluster(cl)
+AIC(m5_bam); BIC(m5_bam)
+logLik.gam(m5_bam)
+summary(m5_bam)
+
+anova(m0_bam, m5_bam, test = "Chisq")
+```
+
+```{r}
+set.seed(82)
+folds = createFolds(training_set$NCLAIMS, k = 5)
+res5 = lapply(folds, function(X) {
+    cl = makeCluster(detectCores() - 1)  # Number of cores to use
+    m5_bam = bam(NCLAIMS ~ offset(log(EXP)) +  COVERAGE + FUEL + FLEET + s(POWER) + s(AGEC) + s(AGEPH, by=SEX) + s(BM) + s(LONG,LAT, bs="tp"),
+        data = bake(rec5, training_set[-X, ]), family = poisson(link = log), cluster = cl)
+    stopCluster(cl)
+    pred = predict(m5_bam, bake(rec5, training_set[X, ]), type = "response")
+    sum(dpois(x = bake(rec5, training_set[X, ])$NCLAIMS, lambda = pred, log = TRUE))
+})
+
+res5
+apply(cbind(unlist(res0), unlist(res5)), 2, mean)
+```
+
+Based on our computation the optimal model so far with full significance of the parameters would be the model without the *USE* variable and with the variable *SEX* interacting with *POWER*.
+
+### Optimizing the number of nodes
+
+Up to this point, the smoothed components of the continuous variables have been estimated using the default number of basis functions selected by the model. Having identified the optimal model specification, we now refine the model by assessing whether the chosen number of basis functions is sufficient. This is done using the **k.check** function, which provides diagnostic information on the adequacy of the smoothing parameters in the fitted Generalized Additive Model (GAM).
+
+The *k.check* output includes the k-index, which evaluates whether the chosen basis dimension is large enough. Values of the k-index substantially below 1 indicate that the basis dimension may be too small, suggesting potential underfitting and loss of relevant information. In addition, we examine the estimated degrees of freedom (edf) for each smooth term, which reflect the complexity of the fitted relationship. An edf close to 1 indicates an approximately linear effect, whereas an edf approaching the maximum allowable value (k′) suggests that the smooth term may be constrained by an insufficient basis dimension.
+
+Finally, the associated p-value tests the null hypothesis that the selected basis dimension is adequate. Based on these diagnostics, our strategy is to increase the basis dimension whenever the edf is too close to k′, thereby allowing the model to allocate additional degrees of freedom to the smooth term. This adjustment enhances the flexibility of the smoothed functions and reduces the risk of underfitting. 
+
+```{r, fig.width=8, fig.height=6, eval=FALSE}
+k.check(m5_bam)
+gam.check(m5_bam)
+```
+
+With the results from *gam.check* and *k.check*, we assume that most smoothed parameters have large enough nodes, except for the spatial effect that might benefit from a higher k. We thus test with a k value of 35:
+
+```{r}
+cl = makeCluster(detectCores() - 1)
+rec6 <- recipe(NCLAIMS ~ POWER +  COVERAGE + FUEL+ SEX + FLEET + AGEPH + AGEC+ BM
+               + LONG + LAT + EXP, data = training_set)%>%
+  step_mutate(COVERAGE = forcats::fct_collapse(COVERAGE, "(PO,FO)" = c("PO","FO")))%>%
+  prep()
+ 
+m6_bam = bam(NCLAIMS ~ offset(log(EXP)) +  COVERAGE + FUEL + FLEET + s(POWER) + s(AGEC) + s(AGEPH,by=SEX) + s(BM) + s(LONG,LAT, bs="tp", k= 35),
+             data = bake(rec6, training_set), family = poisson(link = log), cluster = cl)
+stopCluster(cl)
+AIC(m6_bam); BIC(m6_bam)
+logLik.gam(m6_bam)
+summary(m6_bam)
+k.check(m6_bam)
+```
+We have extended our analysis by testing a k value of 40, but it gave too much flexibility to the spatial smoothed function, which led to a too high increase in BIC, whereas the maximization of the log-likelihood was not sufficient. We also tried to up the k value of the interaction between Policyholder's age and SEX but their edf remained the same. Therefore, we conclude that the only k-value we should adapt is for the spatial effect.
+```{r}
+set.seed(82)
+folds = createFolds(training_set$NCLAIMS, k = 5)
+res6 = lapply(folds, function(X) {
+    cl = makeCluster(detectCores() - 1)  # Number of cores to use
+    m6_bam = bam(NCLAIMS ~ offset(log(EXP)) +  COVERAGE + FUEL + FLEET + s(POWER) + s(AGEC) + s(AGEPH, by=SEX) + s(BM) + s(LONG,LAT, bs="tp", k=35),
+        data = bake(rec6, training_set[-X, ]), family = poisson(link = log), cluster = cl)
+    stopCluster(cl)
+    pred = predict(m6_bam, bake(rec6, training_set[X, ]), type = "response")
+    sum(dpois(x = bake(rec6, training_set[X, ])$NCLAIMS, lambda = pred, log = TRUE))
+})
+
+res6
+apply(cbind(unlist(res0), unlist(res6)), 2, mean)
+```
+
+We have now to our disposition the most optimal model regarding our data set with a GAM implementation. In the data frame *df_gam* we may find all the key performance indicators from each gam model we computed to allow for comparison. As a result, we see that before reviewing the optimal number of nodes for the spatial term, we add the model *m5_bam* scoring the best for all indicators, except for the log-likelihood. But once we adapted the k value of the spatial component, we were found with an optimal model. Although performs slightly poorer in terms of BIC, model *m6_bam* made a noticeable leap forward in terms of AIC, log-likelihood, cross-validation and adjusted R-squared. This final model may be optimal regarding the data available at hand and the scope of this project, but the low adjusted R-squared score and the little percentage of deviance explained suggest that a low share of the variance is actually explained. The model might require additionnal variables for a better fit, even though current coefficients are significant. 
+
+```{r}
+b0<- c("m0_bam", 99780.17, 100309.9, "/", -49835.92, -9979.203 , 0.0198) #basic
+b1<- c("m1_bam", 99784.1 , 100300, 0.01807 , -49839.3, "/", 0.0198) #remove USE and SEX
+b2<- c("m2_bam", 99780.55, 100302.9, 0.1135 , -49836.87, -9978.296, 0.0198) # Add SEX
+b3<- c("m3_bam", 99750.72, 100329.6, "/", -49816.17,-9974.980 , 0.0202) #SEX*AGEPH 
+b4<- c("m4_bam", 99767.38, 100267.5, "/", -49832.55, -9977.323, 0.02)# SEX*POWER
+b5<- c("m5_bam", 99748.73, 100318, "/", -49816.16 , -9974.389, 0.0202) #b3 + coverage merge
+b6<- c("m6_bam", 99711.45, 100329.9, "/", -49792.49 , -9970.606, 0.0206) # k=35 spat
+m <- matrix(data = rbind(b0, b1, b2, b3, b4, b5, b6),nrow = 7, ncol = 7)
+df_gam <- data.frame(m)
+colnames(df_gam) <- c("Model", "AIC", "BIC", "Anova", "LogLik", "CV", "R_sq (adj)")
+df_gam
+```
+
+We may further examine our GAM model by using the function *gam.check* to gain better insight of the fit of the model.
+
+```{r, gam-check, fig.width=8, fig.height=6, eval=FALSE}
+gam.check(m6_bam)
+```
+
+Based on the QQ-plot we can determine that our model fits in a good way medium risks in the portfolio but observation tend to deviate from the prediction for higher risk/quantile. Therefore, the model might underestimate the value of higher risks, phenomenon commonly observed as a flaw in log-poisson distribution. A solution could be to follow up with another assumed distribution of the number of claims which include an overdispersion factor to deal with this effect of increasing variance, such as a Negative Binomial distribution.
+
+The plot of residuals against the linear predictor exhibits a clear structured pattern, which is typical in Poisson-type models due to the discrete nature of the response and the mean–variance relationship implied by the distribution. The dispersion of the residuals increases as the linear predictor increases, reflecting the fact that higher predicted claim intensities are associated with larger variability in observed outcomes. This fan-shaped pattern does not necessarily indicate model misspecification, but rather the inherent heteroskedasticity of count data modeled under a Poisson assumption. Importantly, no strong systematic deviation from the expected trend is observed, suggesting that the mean structure of the model is broadly adequate.
+
+Let's now compare the AIC and BIC with the ones obtain from the optimal GLM model we performed in the first part of this project, namely, model *rec_8*.
+
+```{r}
+df_freq[9,c("AIC","BIC")]; df_gam[7,c("AIC","BIC")]
+```
+
+We may thus observe empirically that using a GAM model really helps drastically minimize these two performance indicators. We may also test the overall scoring of the two type of model along our prediction and we see that even the worse performing GAM model outscores any of the GLM's regarding AIC and BIC.
+
+## Comparison GAM and GLM
+
+To go one step further in our comparison of the two models, let's also test their prediction behavior and accuracy.
+
+```{r}
+rec_glm <- recipe(NCLAIMS ~ EXP + COVERAGE + FUEL + SEX +
+                            FLEET+ AGEPH_fac + AGEC_fac + POWER_fac +
+                            BM_fac , data = training_set) %>%
+  step_mutate(COVERAGE = forcats::fct_collapse(COVERAGE, "All" = c("PO","FO")))%>%
+  step_mutate(AGEC_fac = forcats::fct_collapse(AGEC_fac, "All" = c("(5,9]","(9,48]"))) %>%
+  step_mutate(AGEPH_fac= forcats :: fct_collapse(AGEPH_fac, "rest" = c("(43.7,56.5]", "(82.2,95.1]","(30.8,43.7]")))%>%
+  step_relevel(AGEPH_fac, ref_level = "rest")%>%
+  prep()
+
+m_glm <- gam(NCLAIMS ~ offset(log(EXP)) +  COVERAGE + FUEL + SEX +
+                            FLEET+ AGEPH_fac + AGEC_fac + POWER_fac +
+                            BM_fac, data = bake(rec_glm, training_set), family = poisson(link="log"))
+```
+
+```{r}
+set.seed(82)
+require(parallel)
+resglm = lapply(folds, function(X) {
+    cl = makeCluster(detectCores() - 1)  # Number of cores to use
+    m_glm <- gam(NCLAIMS ~ offset(log(EXP)) +  COVERAGE + FUEL + SEX +
+                            FLEET+ AGEPH_fac + AGEC_fac + POWER_fac +
+                            BM_fac, data = bake(rec_glm, training_set), family = poisson(link="log"), cluster = cl)
+    stopCluster(cl)
+    pred = predict(m_glm, bake(rec_glm, training_set[X, ]), type = "response")
+    sum(dpois(x = bake(rec_glm, training_set[X, ])$NCLAIMS, lambda = pred, log = TRUE))
+})
+
+resglm
+apply(cbind(unlist(resglm), unlist(res6)), 2, mean)
+```
+
+While going one step further, GLM performs poorly in cross validation test compared to GAM.
+
+```{r}
+testing_set$GLM_pred = predict(m_glm, bake(rec_glm, testing_set), type="response")
+testing_set$GAM_pred = predict(m6_bam, bake(rec6, testing_set), type="response")
+head(testing_set[,c("GLM_pred", "GAM_pred")], n=5)
+```
+
+```{r}
+ggplot(testing_set) + geom_point(aes(x=GLM_pred, y=GAM_pred))+ylab("GAM")+xlab("GLM")+geom_abline(slope=1, intercept=0, color="red")+
+  scale_x_continuous(labels = scales::percent_format(accuracy = 0.01))+
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.01))
+```
+
+With the resulting prediction-prediction plot, we evaluate the observations in each frequency model and how it relates to the ones from the other. We have the red line being the linear fit between the two models. Essentially, we can deduct that observations are highly correlated with a positive relationship. This can be defined by low risk values in the GLM represented as low-risk value in the GAM and vice versa. Basically, models are not contradicting one another and that is a good sign. Although for low-risk values, they appear similar, we observe a slightly different behavior for medium to high risk observations. The higher density of observations above the red line tend to show that the GAM model is more sensitive in the tail distribution of risks.
+
+This phenomenon might be explained by the use of smoothed continuous variables instead of factorized ones in the GLM. The smoothing function enables us to deal with continuous variables in a more reliable way and thus further refine risk differentiation instead of classifying and generalizing effects over a potentially unrepresentative subgroup. Furthermore, the GAM also enables us to use spatial differentiation which might also be a crucial indicator for risk identification. Altogether, dealing with continuous variables more efficiently with GAM has a positive impact on our model accuracy but also on interpretation as the differentiation between different risk profiles is more refined. Using A GAM, despite its heavier computation time, may helps the insurer provide a more accurate picture of the risk in his portfolio and properly assess it to aim for more accurate pricing when dealing with an actuarial matter.
+
+When computing the total amount of claims resulting from our prediction, we obtain a slightly lower amount for the GAM model than for the GLM.
+
+```{r}
+sum(testing_set$GLM_pred);sum(testing_set$GAM_pred)
+```
+
+### Analysis of the smoothed functions
+
+Let's now explore in a more detailed way the different smoothed functions we have computed and their interpretation.
+
+First with respect to *POWER*, we observe a straightforward interpretation of the effect of the horsepower of the vehicle on the amount of claims. Indeed, claim frequency rises as the vehicle has more power while we observe more uncertainty with a wider confidence interval the higher the horsepower in kw.
+
+```{r}
+
+plot(m6_bam , select=1 , trans = exp, scale = 0, shade = TRUE, shade.col = "lightblue", col="red")
+
+```
+
+Now with respect to the car's age, we tend to observe in our portfolio that the older the car, the lower the frequency of claims we obtain, but with again, a higher variance. The only period where there is a higher frequency is for rather new vehicles (under 5 years), which might be explained by the urge of policyholders to extract the most of their vehicle. Another hypothesis could be for policyholders who change vehicle more regularly due to accidents could fall fall in that category.
+
+```{r}
+
+plot(m6_bam , select=2 , trans = exp, scale = 0, shade = TRUE, shade.col = "lightblue", col="red")
+
+```
+
+We have already seen while binning the age of policyholders in the GLM section that amount of claims is highly influenced by the age of policyholders. But since we evaluate the age and its interaction with the sex, we see two different patterns regarding the gender of the insured. On the one hand, Men follow the same pattern observed for the overall portfolio, representing high risk and claim frequency at young ages (18 to 25). We then have a downward trend for middle aged men as the driver gets more driving experience and maturity. Finally, we observe an upward slope for elderly people that are seen to be causing more claims due to various factors impacted by their age. For example, poorer eyesight as the policyholder ages might be a leading cause of higher claims. As a result, the age group around 65 for men is the safest risk profile based on our observations. 
+
+Women exhibit a distinctly different claim frequency trajectory across their lifespan compared to men. Young female drivers (age 18) are initially considered higher risk due to limited driving experience, with claim frequencies approximately 20% above the reference level. However, this elevated risk diminishes rapidly, albeit with some fluctuation.
+
+Interestingly, middle-aged women and middle-aged men exhibit comparable claim frequencies, suggesting that gender differences in driving risk are most pronounced at the extremes of the age distribution rather than during the middle years. This pattern may reflect differences in driving behavior, risk exposure, or compensatory strategies that evolve differentially by gender across the lifespan. 
+
+A notable transition occurs around age 50, where female drivers reach parity with the reference level. Unlike their male counterparts, women continue to demonstrate declining claim frequencies beyond this point, with no evidence of the upward trend observed in older male drivers. Although, these are the analysis and prediction of our model, but the lack of data for older ages displays a higher variance for elderly, which could also results in an upward trend as indicated by the confidence interval. 
+
+```{r}
+
+plot(m6_bam , select=3 , trans = exp, scale = 0, shade = TRUE, shade.col = "lightblue", col="red")
+plot(m6_bam , select=4 , trans = exp, scale = 0, shade = TRUE, shade.col = "lightblue", col="red")
+
+```
+
+Finally, we have the position on the bonus-malus scale which is highly correlated with the amount of claims and thus highly impact the frequency predictions. Let's recall that the higher a policyholder is on the ladder, the more claims that person declared in the recent years. As a result, the claim history of a person has a major influence on the claim frequency as it means that the policyholder has reported claims lately, especially to land in the higher levels. For this reason, we observe an upward effect of the frequency respective to the level on the bonus-malus scale.
+
+```{r}
+
+plot(m6_bam , select=5 , trans = exp, scale = 0, shade = TRUE, shade.col = "lightblue", col="red")
+
+```
+
+A general remark regarding the smoothed functions is that we almost always observe higher prediction interval for extreme values (low and/or high). This is explained by the lower amount of observed data in those extreme cases, which makes it more difficult for the model to provide a narrower prediction interval. Lower observations might thus lead to higher variance for a same value, even if continuous.
+
+To conclude this project let's review the spatial effect with respect to longitude and latitude on the claim frequencies. Here is the plot we obtain based on the bam fitted model.
+
+```{r}
+
+plot(m6_bam , select=6 , trans = exp, scale = 0, shade = TRUE)
+
+```
+
+Based on the previous model we can see clusters where there is a higher predicted frequency of claims. We thus tried a more visual representation of the frequency on a belgian map. Unfortunately, due to issues loading maps with an administrative level above states, We had to stick with a colored map as such. But we still may observe a higher claim frequency trend for most populated areas such as Brussels, Walloon Brabant, Liege and East-Flanders.  
+
+```{r}
+library(sf)
+library(ggplot2)
+library(dplyr)
+
+library(rnaturalearth)
+library(rnaturalearthdata)
+belgium_sf <- ne_states(country = "belgium", returnclass = "sf")
+
+# Belgium states
+belgium_centroids <- st_centroid(belgium_sf)
+coords <- st_coordinates(belgium_centroids)
+
+belgium_sf$LONG <- coords[, "X"]
+belgium_sf$LAT <- coords[, "Y"]
+
+# median of variables
+belgium_sf$AGEC <- median(training_set$AGEC, na.rm = TRUE)
+belgium_sf$AGEPH <- median(training_set$AGEPH, na.rm = TRUE)
+belgium_sf$EXP <- 1
+
+belgium_pred <- belgium_sf %>%
+  mutate(
+    # median of continuous variables
+    AGEC = median(training_set$AGEC, na.rm = TRUE),
+    AGEPH = median(training_set$AGEPH, na.rm = TRUE),
+    POWER = median(training_set$POWER, na.rm = TRUE),
+    BM = median(training_set$BM, na.rm = TRUE),
+    EXP = 1,  
+    
+    # discret variables
+    COVERAGE = names(which.max(table(training_set$COVERAGE))),
+    FUEL = names(which.max(table(training_set$FUEL))),
+    SEX = names(which.max(table(training_set$SEX))),
+    USE = names(which.max(table(training_set$USE))),
+    FLEET = names(which.max(table(training_set$FLEET)))
+  )
+
+# Spatial effect for each state
+belgium_pred$spatial_effect <- predict(m6_bam, 
+                                     newdata = belgium_pred, 
+                                     type = "terms")[, "s(LONG,LAT)"]
+str(belgium_pred$spatial_effect)
+# multiplicator factor
+belgium_pred$risk_factor <- exp(as.numeric(belgium_pred$spatial_effect))
+
+library(ggplot2)
+library(viridis)
+
+ggplot(belgium_pred) +
+  geom_sf(aes(fill = risk_factor), color = "white", size = 0.1) +
+  scale_fill_gradient2(
+    low = "#2E7D32",      # low risk
+    mid = "#FDD835",      # medium risk
+    high = "#C62828",     # high risk
+    midpoint = 1,
+    name = "Risk factor",
+    limits = c(0.5, 1.5),
+    breaks = seq(0.5, 1.5, 0.25),
+    labels = c("0.5 (-50%)", "0.75 (-25%)", "1.0 (r0)", 
+               "1.25 (+25%)", "1.5 (+50%)")
+  ) +
+  labs(
+    title = "Risk map of claims frequency in Belgium"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    axis.title = element_blank(),
+    panel.grid = element_blank(),
+    legend.position = "right"
+  )
+
+```
